@@ -1,0 +1,33 @@
+[package]
+name = "mtp-mount"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Mount MTP devices as local filesystems via FUSE"
+repository = "https://github.com/vdavid/mtp-mount"
+keywords = ["mtp", "fuse", "mount", "android", "filesystem"]
+categories = ["filesystem", "hardware-support"]
+readme = "README.md"
+exclude = [
+    ".github/",
+    "AGENTS.md",
+    "docs/",
+    "justfile",
+    "deny.toml",
+    "clippy.toml",
+    "rustfmt.toml",
+]
+
+[dependencies]
+mtp-rs = { path = "../mtp-rs", features = ["virtual-device"] }
+fuser = "0.17"
+tokio = { version = "1.51", features = ["rt-multi-thread", "macros", "sync", "time"] }
+clap = { version = "4.6", features = ["derive"] }
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2.2"
