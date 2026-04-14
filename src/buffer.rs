@@ -1,66 +1,84 @@
 use std::collections::HashMap;
+use std::io;
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::error::MountError;
 
-/// Per-file write buffer holding data until flush/close.
+/// Per-file write buffer backed by a temp file.
 pub struct FileBuffer {
     pub inode: u64,
     #[allow(dead_code)]
     pub original_size: u64,
-    data: Vec<u8>,
+    file: std::fs::File,
+    len: u64,
     dirty: bool,
 }
 
 impl FileBuffer {
-    pub fn new(inode: u64, original_size: u64) -> Self {
-        Self {
+    pub fn new(inode: u64, original_size: u64) -> io::Result<Self> {
+        Ok(Self {
             inode,
             original_size,
-            data: Vec::new(),
+            file: tempfile::tempfile()?,
+            len: 0,
             dirty: false,
-        }
+        })
     }
 
-    /// Write `data` at `offset`, growing the buffer and zero-filling gaps as needed.
+    /// Write `data` at `offset`, growing the file and zero-filling gaps as needed.
     /// Returns the number of bytes written.
-    pub fn write_at(&mut self, offset: i64, data: &[u8]) -> u32 {
-        let offset = offset as usize;
-        let end = offset + data.len();
-        if end > self.data.len() {
-            self.data.resize(end, 0);
+    pub fn write_at(&mut self, offset: i64, data: &[u8]) -> io::Result<u32> {
+        let offset = offset as u64;
+        let end = offset + data.len() as u64;
+
+        // Zero-fill gaps if writing past current end
+        if offset > self.len {
+            self.file.seek(SeekFrom::Start(self.len))?;
+            let gap = offset - self.len;
+            let zeros = vec![0u8; gap as usize];
+            self.file.write_all(&zeros)?;
         }
-        self.data[offset..end].copy_from_slice(data);
+
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(data)?;
+
+        if end > self.len {
+            self.len = end;
+        }
         self.dirty = true;
-        data.len() as u32
+        Ok(data.len() as u32)
     }
 
     /// Read up to `size` bytes starting at `offset`. Returns fewer bytes if
     /// the offset is near or past the end.
-    pub fn read_at(&self, offset: i64, size: u32) -> Vec<u8> {
-        let offset = offset as usize;
-        if offset >= self.data.len() {
-            return Vec::new();
+    pub fn read_at(&mut self, offset: i64, size: u32) -> io::Result<Vec<u8>> {
+        let offset = offset as u64;
+        if offset >= self.len {
+            return Ok(Vec::new());
         }
-        let end = (offset + size as usize).min(self.data.len());
-        self.data[offset..end].to_vec()
+        let available = (self.len - offset).min(size as u64) as usize;
+        let mut buf = vec![0u8; available];
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.read_exact(&mut buf)?;
+        Ok(buf)
     }
 
     pub fn len(&self) -> u64 {
-        self.data.len() as u64
+        self.len
     }
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.len == 0
     }
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
 
-    /// Consume the buffer and return the raw data.
-    pub fn into_data(self) -> Vec<u8> {
-        self.data
+    /// Consume the buffer and return the backing file.
+    pub fn into_file(self) -> std::fs::File {
+        self.file
     }
 }
 
@@ -83,10 +101,15 @@ impl WriteBuffer {
     }
 
     /// Register a new write buffer for the given file handle.
-    pub fn open(&mut self, fh: u64, inode: u64, original_size: u64) -> &mut FileBuffer {
-        self.buffers
-            .entry(fh)
-            .or_insert_with(|| FileBuffer::new(inode, original_size))
+    pub fn open(&mut self, fh: u64, inode: u64, original_size: u64) -> io::Result<&mut FileBuffer> {
+        use std::collections::hash_map::Entry;
+        match self.buffers.entry(fh) {
+            Entry::Occupied(e) => Ok(e.into_mut()),
+            Entry::Vacant(e) => {
+                let fb = FileBuffer::new(inode, original_size)?;
+                Ok(e.insert(fb))
+            }
+        }
     }
 
     /// Write data at offset into the buffer for `fh`.
@@ -95,16 +118,16 @@ impl WriteBuffer {
             .buffers
             .get_mut(&fh)
             .ok_or_else(|| MountError::Other(format!("no buffer for file handle {fh}")))?;
-        Ok(buf.write_at(offset, data))
+        Ok(buf.write_at(offset, data)?)
     }
 
     /// Read data from the buffer for `fh`.
-    pub fn read(&self, fh: u64, offset: i64, size: u32) -> Result<Vec<u8>, MountError> {
+    pub fn read(&mut self, fh: u64, offset: i64, size: u32) -> Result<Vec<u8>, MountError> {
         let buf = self
             .buffers
-            .get(&fh)
+            .get_mut(&fh)
             .ok_or_else(|| MountError::Other(format!("no buffer for file handle {fh}")))?;
-        Ok(buf.read_at(offset, size))
+        Ok(buf.read_at(offset, size)?)
     }
 
     /// Remove and return the buffer for flushing to MTP.
@@ -141,7 +164,7 @@ mod tests {
     #[test]
     fn test_open_creates_buffer() {
         let mut wb = WriteBuffer::new();
-        wb.open(1, 100, 0);
+        wb.open(1, 100, 0).unwrap();
         assert!(wb.is_open(1));
         assert_eq!(wb.size(1), Some(0));
     }
@@ -149,7 +172,7 @@ mod tests {
     #[test]
     fn test_write_sequential() {
         let mut wb = WriteBuffer::new();
-        wb.open(1, 100, 0);
+        wb.open(1, 100, 0).unwrap();
         wb.write(1, 0, b"hello").unwrap();
         wb.write(1, 5, b" world").unwrap();
         assert_eq!(wb.size(1), Some(11));
@@ -160,7 +183,7 @@ mod tests {
     #[test]
     fn test_write_at_offset() {
         let mut wb = WriteBuffer::new();
-        wb.open(1, 100, 0);
+        wb.open(1, 100, 0).unwrap();
         wb.write(1, 5, b"abc").unwrap();
         assert_eq!(wb.size(1), Some(8));
         let data = wb.read(1, 0, 8).unwrap();
@@ -170,7 +193,7 @@ mod tests {
     #[test]
     fn test_write_overwrite() {
         let mut wb = WriteBuffer::new();
-        wb.open(1, 100, 0);
+        wb.open(1, 100, 0).unwrap();
         wb.write(1, 0, b"hello").unwrap();
         wb.write(1, 1, b"ELL").unwrap();
         let data = wb.read(1, 0, 5).unwrap();
@@ -180,7 +203,7 @@ mod tests {
     #[test]
     fn test_read_back() {
         let mut wb = WriteBuffer::new();
-        wb.open(1, 100, 0);
+        wb.open(1, 100, 0).unwrap();
         wb.write(1, 0, b"test data").unwrap();
         let data = wb.read(1, 5, 4).unwrap();
         assert_eq!(&data, b"data");
@@ -189,7 +212,7 @@ mod tests {
     #[test]
     fn test_read_past_end() {
         let mut wb = WriteBuffer::new();
-        wb.open(1, 100, 0);
+        wb.open(1, 100, 0).unwrap();
         wb.write(1, 0, b"short").unwrap();
         let data = wb.read(1, 3, 100).unwrap();
         assert_eq!(&data, b"rt");
@@ -198,7 +221,7 @@ mod tests {
     #[test]
     fn test_read_empty() {
         let mut wb = WriteBuffer::new();
-        wb.open(1, 100, 0);
+        wb.open(1, 100, 0).unwrap();
         let data = wb.read(1, 0, 10).unwrap();
         assert!(data.is_empty());
     }
@@ -206,17 +229,21 @@ mod tests {
     #[test]
     fn test_flush_returns_data() {
         let mut wb = WriteBuffer::new();
-        wb.open(1, 100, 0);
+        wb.open(1, 100, 0).unwrap();
         wb.write(1, 0, b"flush me").unwrap();
         let fb = wb.flush(1).unwrap();
         assert_eq!(fb.inode, 100);
-        assert_eq!(fb.into_data(), b"flush me");
+        let mut file = fb.into_file();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents).unwrap();
+        assert_eq!(&contents, b"flush me");
     }
 
     #[test]
     fn test_flush_removes_buffer() {
         let mut wb = WriteBuffer::new();
-        wb.open(1, 100, 0);
+        wb.open(1, 100, 0).unwrap();
         wb.write(1, 0, b"data").unwrap();
         wb.flush(1);
         assert!(!wb.is_open(1));
@@ -225,7 +252,7 @@ mod tests {
     #[test]
     fn test_dirty_tracking() {
         let mut wb = WriteBuffer::new();
-        let fb = wb.open(1, 100, 0);
+        let fb = wb.open(1, 100, 0).unwrap();
         assert!(!fb.is_dirty());
         wb.write(1, 0, b"x").unwrap();
         // Need to access via flush since we can't borrow after write through wb
@@ -236,8 +263,8 @@ mod tests {
     #[test]
     fn test_multiple_files() {
         let mut wb = WriteBuffer::new();
-        wb.open(1, 100, 0);
-        wb.open(2, 200, 0);
+        wb.open(1, 100, 0).unwrap();
+        wb.open(2, 200, 0).unwrap();
         wb.write(1, 0, b"file1").unwrap();
         wb.write(2, 0, b"file2").unwrap();
         assert!(wb.is_open(1));
@@ -256,7 +283,7 @@ mod tests {
     #[test]
     fn test_large_write() {
         let mut wb = WriteBuffer::new();
-        wb.open(1, 100, 0);
+        wb.open(1, 100, 0).unwrap();
         let big = vec![0xABu8; 2 * 1024 * 1024]; // 2 MB
         let written = wb.write(1, 0, &big).unwrap();
         assert_eq!(written, 2 * 1024 * 1024);
@@ -266,7 +293,7 @@ mod tests {
     #[test]
     fn test_sparse_write() {
         let mut wb = WriteBuffer::new();
-        wb.open(1, 100, 0);
+        wb.open(1, 100, 0).unwrap();
         wb.write(1, 1000, b"sparse").unwrap();
         assert_eq!(wb.size(1), Some(1006));
         let prefix = wb.read(1, 0, 1000).unwrap();

@@ -80,6 +80,29 @@ fn bytes_stream(
     futures::stream::iter(chunks)
 }
 
+/// Read a file in 64KB chunks and return as a stream.
+fn file_stream(
+    mut file: std::fs::File,
+) -> futures::stream::Iter<std::vec::IntoIter<Result<Bytes, io::Error>>> {
+    use std::io::Read as _;
+    let mut chunks = Vec::new();
+    loop {
+        let mut buf = vec![0u8; 65536];
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.truncate(n);
+                chunks.push(Ok(Bytes::from(buf)));
+            }
+            Err(e) => {
+                chunks.push(Err(e));
+                break;
+            }
+        }
+    }
+    futures::stream::iter(chunks)
+}
+
 /// Mutable state protected by `RefCell` so fuser's `&self` callbacks can mutate it.
 struct Inner {
     storages: Vec<Storage>,
@@ -212,7 +235,16 @@ impl MtpFs {
         }
 
         let inode = buf.inode;
-        let data = buf.into_data();
+        let mut file = buf.into_file();
+        if let Err(e) = file.seek(SeekFrom::Start(0)) {
+            error!("Flush: failed to rewind temp file: {e}");
+            return;
+        }
+        let file_len = file.seek(SeekFrom::End(0)).unwrap_or(0);
+        if let Err(e) = file.seek(SeekFrom::Start(0)) {
+            error!("Flush: failed to rewind temp file: {e}");
+            return;
+        }
         let entry = match inner.inodes.get(inode) {
             Some(e) => e.clone(),
             None => {
@@ -250,9 +282,9 @@ impl MtpFs {
             return;
         }
 
-        let size = data.len() as u64;
+        let size = file_len;
         let info = NewObjectInfo::file(&entry.name, size);
-        let stream = bytes_stream(data);
+        let stream = file_stream(file);
 
         match self
             .rt
@@ -589,7 +621,11 @@ impl Filesystem for MtpFs {
 
         if !inner.write_buf.is_open(fh_val) {
             let original_size = inner.inodes.get(ino.0).map(|e| e.size).unwrap_or(0);
-            inner.write_buf.open(fh_val, ino.0, original_size);
+            if let Err(e) = inner.write_buf.open(fh_val, ino.0, original_size) {
+                error!("Failed to open write buffer: {e}");
+                reply.error(Errno::EIO);
+                return;
+            }
         }
 
         match inner.write_buf.write(fh_val, offset as i64, data) {
@@ -665,7 +701,11 @@ impl Filesystem for MtpFs {
 
         let fh = self.alloc_fh();
         inner.fh_to_inode.insert(fh, ino);
-        inner.write_buf.open(fh, ino, 0);
+        if let Err(e) = inner.write_buf.open(fh, ino, 0) {
+            error!("Failed to open write buffer: {e}");
+            reply.error(Errno::EIO);
+            return;
+        }
 
         let entry = inner.inodes.get(ino).unwrap();
         let attr = inode_to_file_attr(entry);
@@ -978,12 +1018,20 @@ impl Filesystem for MtpFs {
 
                 if !inner.write_buf.is_open(fh_val) {
                     let original_size = inner.inodes.get(ino.0).map(|e| e.size).unwrap_or(0);
-                    inner.write_buf.open(fh_val, ino.0, original_size);
+                    if let Err(e) = inner.write_buf.open(fh_val, ino.0, original_size) {
+                        error!("Failed to open write buffer: {e}");
+                        reply.error(Errno::EIO);
+                        return;
+                    }
                 }
 
                 if new_size == 0 {
                     inner.write_buf.close(fh_val);
-                    inner.write_buf.open(fh_val, ino.0, 0);
+                    if let Err(e) = inner.write_buf.open(fh_val, ino.0, 0) {
+                        error!("Failed to open write buffer: {e}");
+                        reply.error(Errno::EIO);
+                        return;
+                    }
                 }
             }
         }
