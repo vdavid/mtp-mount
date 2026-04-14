@@ -1,6 +1,7 @@
 mod buffer;
 mod error;
 mod fs;
+#[allow(dead_code)]
 mod inode;
 
 use clap::Parser;
