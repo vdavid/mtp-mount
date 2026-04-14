@@ -5,6 +5,7 @@ use crate::error::MountError;
 /// Per-file write buffer holding data until flush/close.
 pub struct FileBuffer {
     pub inode: u64,
+    #[allow(dead_code)]
     pub original_size: u64,
     data: Vec<u8>,
     dirty: bool,

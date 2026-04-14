@@ -594,9 +594,12 @@ name = "mtp-mount"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "bytes",
  "clap",
  "env_logger",
  "fuser",
+ "futures",
+ "libc",
  "log",
  "mtp-rs",
  "tempfile",

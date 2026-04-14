@@ -2,7 +2,7 @@ use thiserror::Error;
 
 /// Errors returned by mtp-mount operations.
 #[derive(Debug, Error)]
-#[allow(dead_code)]
+
 pub enum MountError {
     /// An error from the underlying MTP library.
     #[error("MTP error: {0}")]
@@ -14,6 +14,7 @@ pub enum MountError {
 
     /// No MTP device was found on the system.
     #[error("no MTP device found")]
+    #[allow(dead_code)]
     NoDevice,
 
     /// A catch-all for other error conditions.
