@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
+use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -84,7 +85,7 @@ struct Inner {
     storages: Vec<Storage>,
     inodes: InodeTable,
     write_buf: WriteBuffer,
-    read_cache: HashMap<u64, Vec<u8>>,
+    read_cache: HashMap<u64, std::fs::File>,
     dirs_loaded: HashMap<u64, bool>,
     fh_to_inode: HashMap<u64, u64>,
 }
@@ -475,28 +476,72 @@ impl Filesystem for MtpFs {
                 }
             };
 
-            match self
+            let mut download = match self
                 .rt
-                .block_on(inner.storages[storage_idx].download(handle))
+                .block_on(inner.storages[storage_idx].download_stream(handle))
             {
-                Ok(data) => {
-                    inner.read_cache.insert(fh_val, data);
-                }
+                Ok(d) => d,
                 Err(e) => {
-                    error!("MTP download failed: {e}");
+                    error!("MTP download_stream failed: {e}");
                     reply.error(Errno::EIO);
                     return;
                 }
+            };
+
+            let mut file = match tempfile::tempfile() {
+                Ok(f) => f,
+                Err(e) => {
+                    error!("Failed to create temp file: {e}");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
+
+            let write_ok = self.rt.block_on(async {
+                while let Some(chunk) = download.next_chunk().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            if let Err(e) = file.write_all(&bytes) {
+                                error!("Failed to write to temp file: {e}");
+                                return false;
+                            }
+                        }
+                        Err(e) => {
+                            error!("MTP download chunk failed: {e}");
+                            return false;
+                        }
+                    }
+                }
+                true
+            });
+
+            if !write_ok {
+                reply.error(Errno::EIO);
+                return;
             }
+
+            inner.read_cache.insert(fh_val, file);
         }
 
-        let cached = &inner.read_cache[&fh_val];
-        let off = offset as usize;
-        if off >= cached.len() {
+        let file = inner.read_cache.get_mut(&fh_val).unwrap();
+        let file_size = file.seek(SeekFrom::End(0)).unwrap_or(0);
+        if offset >= file_size {
             reply.data(&[]);
         } else {
-            let end = (off + size as usize).min(cached.len());
-            reply.data(&cached[off..end]);
+            let read_len = (size as u64).min(file_size - offset) as usize;
+            let mut buf = vec![0u8; read_len];
+            if let Err(e) = file.seek(SeekFrom::Start(offset)) {
+                error!("Seek failed: {e}");
+                reply.error(Errno::EIO);
+                return;
+            }
+            match file.read_exact(&mut buf) {
+                Ok(()) => reply.data(&buf),
+                Err(e) => {
+                    error!("Read from temp file failed: {e}");
+                    reply.error(Errno::EIO);
+                }
+            }
         }
     }
 
