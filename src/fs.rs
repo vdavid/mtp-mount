@@ -13,7 +13,7 @@ use fuser::{
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
     TimeOrNow, WriteFlags,
 };
-use log::{debug, error};
+use log::{debug, error, warn};
 use mtp_rs::mtp::MtpDevice;
 use mtp_rs::{NewObjectInfo, ObjectHandle, Storage};
 
@@ -223,7 +223,11 @@ impl MtpFs {
         inner.dirs_loaded.insert(parent_inode, true);
     }
 
-    /// Flush a dirty write buffer to MTP by deleting the old object and uploading new data.
+    /// Flush a dirty write buffer to MTP.
+    ///
+    /// When the device supports rename, uses a safe upload-then-delete-then-rename
+    /// sequence to avoid data loss if the upload fails. Falls back to
+    /// delete-then-upload on devices without rename support.
     fn flush_to_mtp(&self, inner: &mut Inner, fh: u64) {
         let buf = match inner.write_buf.close(fh) {
             Some(b) => b,
@@ -275,14 +279,121 @@ impl MtpFs {
             _ => None,
         });
 
+        let supports_rename = self.device.lock().unwrap().supports_rename();
+
+        if supports_rename {
+            self.flush_safe(
+                inner,
+                inode,
+                handle,
+                storage_idx,
+                parent_handle,
+                &entry,
+                file_len,
+                file,
+            );
+        } else {
+            warn!(
+                "Flush: device does not support rename, using delete-then-upload \
+                 (data loss possible if upload fails)"
+            );
+            self.flush_unsafe(
+                inner,
+                inode,
+                handle,
+                storage_idx,
+                parent_handle,
+                &entry,
+                file_len,
+                file,
+            );
+        }
+    }
+
+    /// Safe flush: upload with temp name, delete old, rename new.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_safe(
+        &self,
+        inner: &mut Inner,
+        inode: u64,
+        old_handle: ObjectHandle,
+        storage_idx: usize,
+        parent_handle: Option<ObjectHandle>,
+        entry: &InodeEntry,
+        size: u64,
+        file: std::fs::File,
+    ) {
+        let storage = &inner.storages[storage_idx];
+        let temp_name = format!(".~tmp~{}", entry.name);
+
+        // Step 1: Upload new data with a temp name.
+        let info = NewObjectInfo::file(&temp_name, size);
+        let stream = file_stream(file);
+        let new_handle = match self
+            .rt
+            .block_on(storage.upload(parent_handle, info, stream))
+        {
+            Ok(h) => h,
+            Err(e) => {
+                error!("Flush: upload failed (original file untouched): {e}");
+                return;
+            }
+        };
+
+        // Step 2: Delete old object.
+        if let Err(e) = self.rt.block_on(storage.delete(old_handle)) {
+            error!("Flush: failed to delete old object (new data saved as '{temp_name}'): {e}");
+            if let Some(e) = inner.inodes.get_mut(inode) {
+                e.kind = InodeKind::File { handle: new_handle };
+                e.name = temp_name;
+                e.size = size;
+                e.mtime = SystemTime::now();
+            }
+            return;
+        }
+
+        // Step 3: Rename temp to original name.
+        if let Err(e) = self.rt.block_on(storage.rename(new_handle, &entry.name)) {
+            warn!(
+                "Flush: rename from '{temp_name}' to '{}' failed: {e}",
+                entry.name
+            );
+            if let Some(e) = inner.inodes.get_mut(inode) {
+                e.kind = InodeKind::File { handle: new_handle };
+                e.name = temp_name;
+                e.size = size;
+                e.mtime = SystemTime::now();
+            }
+            return;
+        }
+
+        if let Some(e) = inner.inodes.get_mut(inode) {
+            e.kind = InodeKind::File { handle: new_handle };
+            e.size = size;
+            e.mtime = SystemTime::now();
+        }
+    }
+
+    /// Unsafe flush: delete old object, then upload. Data is lost if upload fails.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_unsafe(
+        &self,
+        inner: &mut Inner,
+        inode: u64,
+        old_handle: ObjectHandle,
+        storage_idx: usize,
+        parent_handle: Option<ObjectHandle>,
+        entry: &InodeEntry,
+        size: u64,
+        file: std::fs::File,
+    ) {
         let storage = &inner.storages[storage_idx];
 
-        if let Err(e) = self.rt.block_on(storage.delete(handle)) {
+        if let Err(e) = self.rt.block_on(storage.delete(old_handle)) {
             error!("Flush: failed to delete old object: {e}");
             return;
         }
 
-        let size = file_len;
         let info = NewObjectInfo::file(&entry.name, size);
         let stream = file_stream(file);
 
@@ -298,7 +409,7 @@ impl MtpFs {
                 }
             }
             Err(e) => {
-                error!("Flush: failed to upload: {e}");
+                error!("Flush: upload failed after delete (data lost): {e}");
             }
         }
     }
