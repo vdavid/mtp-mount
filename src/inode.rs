@@ -47,6 +47,12 @@ pub struct InodeTable {
     next_inode: u64,
 }
 
+impl Default for InodeTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InodeTable {
     /// Creates a new table with only the root inode (inode 1).
     pub fn new() -> Self {

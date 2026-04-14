@@ -49,6 +49,11 @@ impl FileBuffer {
         self.data.len() as u64
     }
 
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -62,6 +67,12 @@ impl FileBuffer {
 /// Manages in-progress file writes, mapping file handles to their buffers.
 pub struct WriteBuffer {
     buffers: HashMap<u64, FileBuffer>,
+}
+
+impl Default for WriteBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WriteBuffer {
