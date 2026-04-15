@@ -8,21 +8,60 @@ use clap::Parser;
 use crate::fs::MtpFs;
 
 /// Mount MTP devices as local filesystems via FUSE.
+///
+/// Plug in your Android phone or camera, run this, and use regular
+/// commands (ls, cp, cat, rm, mv, mkdir) on the device's storage.
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(
+    version,
+    about,
+    after_long_help = "\
+EXAMPLES:
+    Mount the first available device:
+        mtp-mount /mnt/phone
+
+    Mount a specific device (find serials with `lsusb` or `mtp-mount --list`):
+        mtp-mount -d ABC123 /mnt/phone
+
+    Mount read-only (safer for browsing, no accidental deletes):
+        mtp-mount -r /mnt/phone
+
+    Unmount:
+        umount /mnt/phone
+
+    Show debug output (handy for troubleshooting):
+        RUST_LOG=debug mtp-mount /mnt/phone
+
+TROUBLESHOOTING:
+    \"No MTP device found\"
+        Make sure the phone is unlocked, USB mode is set to \"File Transfer\"
+        (not \"Charging only\"), and the USB debugging prompt is accepted.
+
+    \"interface is busy\"
+        Another program already claimed the USB interface. On Linux, check
+        if gvfs-mtp auto-mounted it: `gio mount -l` and unmount first.
+
+    \"Permission denied\" on /dev/bus/usb
+        Add yourself to the `plugdev` group, or set up a udev rule.
+        See: https://github.com/vdavid/mtp-mount#requirements
+
+NOTES:
+    Files are uploaded to the device when you close them, not on each write.
+    MTP doesn't support partial writes, hardlinks, symlinks, or chmod."
+)]
 struct Cli {
-    /// Directory where the MTP device will be mounted
+    /// Where to mount (the directory must already exist)
     mountpoint: String,
 
-    /// Device serial number (uses first available device if omitted)
-    #[arg(short, long)]
+    /// Device serial number (connects to the first available device if omitted)
+    #[arg(short, long, value_name = "SERIAL")]
     device: Option<String>,
 
     /// Run in foreground instead of daemonizing
     #[arg(short, long, default_value_t = true)]
     foreground: bool,
 
-    /// Mount the device as read-only
+    /// Mount as read-only (no writes, deletes, or renames)
     #[arg(short, long)]
     read_only: bool,
 }
