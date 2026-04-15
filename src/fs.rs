@@ -150,7 +150,10 @@ impl MtpFs {
         loop {
             let entry = inner.inodes.get(current)?;
             if let InodeKind::Storage { storage_id } = &entry.kind {
-                return inner.storages.iter().position(|s| s.id() == *storage_id);
+                return inner
+                    .storages
+                    .iter()
+                    .position(|s: &Storage| s.id() == *storage_id);
             }
             if current == entry.parent {
                 return None;
@@ -436,10 +439,11 @@ impl Filesystem for MtpFs {
         let storages = self
             .rt
             .block_on(self.device.lock().unwrap().storages())
-            .map_err(|e| io::Error::other(e.to_string()))?;
+            .map_err(|e: mtp_rs::Error| io::Error::other(e.to_string()))?;
 
         let mut inner = self.inner.lock().unwrap();
         for storage in &storages {
+            let storage: &Storage = storage;
             let name = if storage.info().description.is_empty() {
                 format!("Storage_{}", storage.id().0)
             } else {
@@ -620,7 +624,7 @@ impl Filesystem for MtpFs {
                 }
             };
 
-            let mut download = match self
+            let mut download: mtp_rs::FileDownload = match self
                 .rt
                 .block_on(inner.storages[storage_idx].download_stream(handle))
             {
@@ -642,18 +646,17 @@ impl Filesystem for MtpFs {
             };
 
             let write_ok = self.rt.block_on(async {
-                while let Some(chunk) = download.next_chunk().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if let Err(e) = file.write_all(&bytes) {
-                                error!("Failed to write to temp file: {e}");
-                                return false;
-                            }
-                        }
+                while let Some(chunk_result) = download.next_chunk().await {
+                    let bytes: Bytes = match chunk_result {
+                        Ok(b) => b,
                         Err(e) => {
                             error!("MTP download chunk failed: {e}");
                             return false;
                         }
+                    };
+                    if let Err(e) = file.write_all(&bytes) {
+                        error!("Failed to write to temp file: {e}");
+                        return false;
                     }
                 }
                 true
