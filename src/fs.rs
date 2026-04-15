@@ -1168,7 +1168,20 @@ impl Filesystem for MtpFs {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 4096, 255, 0);
+        let inner = self.inner.lock().unwrap();
+        let block_size: u64 = 4096;
+
+        let mut total_bytes: u64 = 0;
+        let mut free_bytes: u64 = 0;
+        for storage in &inner.storages {
+            total_bytes = total_bytes.saturating_add(storage.info().max_capacity);
+            free_bytes = free_bytes.saturating_add(storage.info().free_space_bytes);
+        }
+
+        let blocks = total_bytes / block_size;
+        let bfree = free_bytes / block_size;
+
+        reply.statfs(blocks, bfree, bfree, 0, 0, block_size as u32, 255, 0);
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
