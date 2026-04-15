@@ -20,7 +20,10 @@ EXAMPLES:
     Mount the first available device:
         mtp-mount /mnt/phone
 
-    Mount a specific device (find serials with `lsusb` or `mtp-mount --list`):
+    List connected devices (shows serial numbers for -d):
+        mtp-mount --list
+
+    Mount a specific device:
         mtp-mount -d ABC123 /mnt/phone
 
     Mount read-only (safer for browsing, no accidental deletes):
@@ -51,7 +54,7 @@ NOTES:
 )]
 struct Cli {
     /// Where to mount (the directory must already exist)
-    mountpoint: String,
+    mountpoint: Option<String>,
 
     /// Device serial number (connects to the first available device if omitted)
     #[arg(short, long, value_name = "SERIAL")]
@@ -64,6 +67,42 @@ struct Cli {
     /// Mount as read-only (no writes, deletes, or renames)
     #[arg(short, long)]
     read_only: bool,
+
+    /// List connected MTP devices and exit
+    #[arg(short, long)]
+    list: bool,
+}
+
+fn list_devices() {
+    match mtp_rs::MtpDevice::list_devices() {
+        Ok(devices) if devices.is_empty() => {
+            println!("No MTP devices found.");
+            println!();
+            println!("Make sure your device is unlocked, USB mode is set to");
+            println!("\"File Transfer\", and the USB debugging prompt is accepted.");
+        }
+        Ok(devices) => {
+            println!("Found {} MTP device(s):\n", devices.len());
+            for (i, dev) in devices.iter().enumerate() {
+                let mfr = dev.manufacturer.as_deref().unwrap_or("Unknown");
+                let product = dev.product.as_deref().unwrap_or("Unknown");
+                let serial = dev
+                    .serial_number
+                    .as_deref()
+                    .unwrap_or("(no serial)");
+                println!(
+                    "  [{}] {} {} (serial: {}, USB {:04x}:{:04x})",
+                    i, mfr, product, serial, dev.vendor_id, dev.product_id
+                );
+            }
+            println!();
+            println!("Use -d SERIAL to mount a specific device.");
+        }
+        Err(e) => {
+            eprintln!("Failed to list devices: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn main() {
@@ -71,8 +110,21 @@ fn main() {
 
     let cli = Cli::parse();
 
+    if cli.list {
+        list_devices();
+        return;
+    }
+
+    let mountpoint = match &cli.mountpoint {
+        Some(m) => m,
+        None => {
+            eprintln!("Error: <MOUNTPOINT> is required (or use --list to see devices)");
+            std::process::exit(1);
+        }
+    };
+
     let device_label = cli.device.as_deref().unwrap_or("first available device");
-    println!("Mounting {device_label} at {}...", cli.mountpoint);
+    println!("Mounting {device_label} at {mountpoint}...");
 
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     let handle = rt.handle().clone();
@@ -101,7 +153,7 @@ fn main() {
 
     println!("Mounted. Press Ctrl+C to unmount.");
 
-    if let Err(e) = fuser::mount2(mtp_fs, &cli.mountpoint, &config) {
+    if let Err(e) = fuser::mount2(mtp_fs, mountpoint, &config) {
         eprintln!("Mount failed: {e}");
         std::process::exit(1);
     }
