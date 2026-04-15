@@ -567,6 +567,7 @@ impl Filesystem for MtpFs {
         }
     }
 
+    #[allow(clippy::map_entry)] // entry API doesn't fit: download + error handling between check and insert
     fn read(
         &self,
         _req: &Request,
