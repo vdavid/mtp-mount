@@ -33,9 +33,19 @@ impl TestMount {
         Self::with_setup(|_| {})
     }
 
+    /// Create a mount with device event monitoring enabled.
+    /// The virtual device will emit MTP events when files change on the backing dir.
+    fn with_events() -> Self {
+        Self::build(|_| {}, true)
+    }
+
     /// Create a mount, calling `setup` with the backing dir path before mounting.
     /// Use this to pre-populate files in the virtual device's storage.
     fn with_setup<F: FnOnce(&Path)>(setup: F) -> Self {
+        Self::build(setup, false)
+    }
+
+    fn build<F: FnOnce(&Path)>(setup: F, watch_events: bool) -> Self {
         let backing_dir = TempDir::new().expect("failed to create backing dir");
         let mount_point = TempDir::new().expect("failed to create mount point");
 
@@ -52,8 +62,12 @@ impl TestMount {
                 read_only: false,
             }],
             supports_rename: true,
-            event_poll_interval: Duration::ZERO,
-            watch_backing_dirs: false,
+            event_poll_interval: if watch_events {
+                Duration::from_millis(50)
+            } else {
+                Duration::ZERO
+            },
+            watch_backing_dirs: watch_events,
         };
 
         let rt = tokio::runtime::Runtime::new().expect("failed to create runtime");
@@ -362,3 +376,85 @@ fn test_concurrent_reads() {
     assert_eq!(handle_a.join().unwrap(), "content A");
     assert_eq!(handle_b.join().unwrap(), "content B");
 }
+
+// =============================================================================
+// Device event monitoring (out-of-band changes on the backing dir)
+// =============================================================================
+
+/// Wait until `check` returns true, polling every 100ms for up to 5 seconds.
+fn wait_until(check: impl Fn() -> bool) {
+    for _ in 0..50 {
+        if check() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("Condition not met within 5 seconds");
+}
+
+#[test]
+#[ignore]
+fn test_event_file_created_on_device() {
+    let mount = TestMount::with_events();
+    let storage = mount.storage_path();
+
+    // Populate the FUSE cache by listing the (empty) storage.
+    let entries: Vec<_> = fs::read_dir(&storage)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert_eq!(entries.len(), 0);
+
+    // Create a file directly on the backing dir (simulating device-side change).
+    fs::write(
+        mount.backing_path().join("surprise.txt"),
+        "hello from device",
+    )
+    .unwrap();
+
+    // The file should appear in the FUSE mount after the event propagates.
+    wait_until(|| {
+        fs::read_dir(&storage)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name() == "surprise.txt")
+    });
+
+    let content = fs::read_to_string(storage.join("surprise.txt")).expect("read failed");
+    assert_eq!(content, "hello from device");
+}
+
+#[test]
+#[ignore]
+fn test_event_file_deleted_on_device() {
+    let mount = TestMount::with_events();
+    let storage = mount.storage_path();
+
+    // Create a file via the backing dir before the FUSE cache is populated.
+    fs::write(mount.backing_path().join("doomed.txt"), "goodbye").unwrap();
+
+    // Wait for the creation event to propagate, then verify it's visible.
+    wait_until(|| {
+        fs::read_dir(&storage)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name() == "doomed.txt")
+    });
+
+    // Now delete it directly on the backing dir.
+    fs::remove_file(mount.backing_path().join("doomed.txt")).unwrap();
+
+    // The file should disappear from the FUSE mount.
+    wait_until(|| {
+        !fs::read_dir(&storage)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name() == "doomed.txt")
+    });
+}
+
+// Note: content modification events (overwriting an existing file in place) are
+// intentionally not tested here. The virtual device's filesystem watcher only
+// tracks file/directory creation and removal — content modifications don't change
+// the MTP object tree and real MTP devices are inconsistent about emitting
+// ObjectInfoChanged for content edits. See virtual_device/CLAUDE.md for details.

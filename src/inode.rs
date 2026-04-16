@@ -198,6 +198,17 @@ impl InodeTable {
             .push(inode);
     }
 
+    /// Finds the parent inode of an entry identified by its MTP object handle.
+    /// Returns `None` if the handle is not in the table.
+    pub fn find_parent_by_handle(&self, handle: ObjectHandle) -> Option<u64> {
+        self.entries.values().find_map(|e| match &e.kind {
+            InodeKind::File { handle: h } | InodeKind::Directory { handle: h } if *h == handle => {
+                Some(e.parent)
+            }
+            _ => None,
+        })
+    }
+
     /// Removes all children of the given parent (for cache invalidation).
     pub fn clear_children(&mut self, parent_inode: u64) {
         let child_inodes = self

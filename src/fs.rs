@@ -3,7 +3,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::io::{Read as _, Seek, SeekFrom, Write as _};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -14,7 +14,7 @@ use fuser::{
     TimeOrNow, WriteFlags,
 };
 use log::{debug, error, warn};
-use mtp_rs::mtp::MtpDevice;
+use mtp_rs::mtp::{DeviceEvent, MtpDevice};
 use mtp_rs::{NewObjectInfo, ObjectHandle, Storage};
 
 use crate::buffer::WriteBuffer;
@@ -117,24 +117,28 @@ struct Inner {
 pub struct MtpFs {
     rt: tokio::runtime::Handle,
     device: Mutex<MtpDevice>,
-    inner: Mutex<Inner>,
+    /// Clone of the device for event polling (avoids holding the device lock).
+    event_device: MtpDevice,
+    inner: Arc<Mutex<Inner>>,
     next_fh: AtomicU64,
     read_only: bool,
 }
 
 impl MtpFs {
     pub fn new(device: MtpDevice, read_only: bool, rt: tokio::runtime::Handle) -> Self {
+        let event_device = device.clone();
         Self {
             rt,
             device: Mutex::new(device),
-            inner: Mutex::new(Inner {
+            event_device,
+            inner: Arc::new(Mutex::new(Inner {
                 storages: Vec::new(),
                 inodes: InodeTable::new(),
                 write_buf: WriteBuffer::new(),
                 read_cache: HashMap::new(),
                 dirs_loaded: HashMap::new(),
                 fh_to_inode: HashMap::new(),
-            }),
+            })),
             next_fh: AtomicU64::new(1),
             read_only,
         }
@@ -432,6 +436,93 @@ impl MtpFs {
         }
         opts
     }
+
+    /// Background event loop that polls the device for MTP events and invalidates
+    /// cached directory listings when objects change on the device side.
+    async fn event_loop(device: MtpDevice, inner: Arc<Mutex<Inner>>) {
+        loop {
+            match tokio::time::timeout(Duration::from_millis(200), device.next_event()).await {
+                Ok(Ok(event)) => {
+                    Self::handle_event(&inner, &event);
+                }
+                Ok(Err(mtp_rs::Error::Disconnected)) => {
+                    debug!("Event loop: device disconnected");
+                    break;
+                }
+                Ok(Err(mtp_rs::Error::Timeout)) => continue,
+                Ok(Err(e)) => {
+                    warn!("Event loop error: {e}");
+                    break;
+                }
+                Err(_) => continue, // tokio timeout elapsed, loop again
+            }
+        }
+    }
+
+    /// Process a single device event by invalidating the relevant cache entries.
+    fn handle_event(inner: &Mutex<Inner>, event: &DeviceEvent) {
+        match event {
+            DeviceEvent::ObjectAdded { handle } => {
+                debug!("Event: object added {:?}", handle);
+                let mut inner = inner.lock().unwrap();
+                // The new object might be in any directory. If we can find its parent
+                // in the inode table (the parent dir was already cached), invalidate
+                // just that directory. Otherwise, invalidate all directories.
+                if let Some(parent_ino) = inner.inodes.find_parent_by_handle(*handle) {
+                    inner.dirs_loaded.remove(&parent_ino);
+                } else {
+                    Self::invalidate_all_dirs(&mut inner);
+                }
+            }
+            DeviceEvent::ObjectRemoved { handle } => {
+                debug!("Event: object removed {:?}", handle);
+                let mut inner = inner.lock().unwrap();
+                if let Some(parent_ino) = inner.inodes.find_parent_by_handle(*handle) {
+                    inner.dirs_loaded.remove(&parent_ino);
+                } else {
+                    Self::invalidate_all_dirs(&mut inner);
+                }
+            }
+            DeviceEvent::ObjectInfoChanged { handle } => {
+                debug!("Event: object info changed {:?}", handle);
+                let mut inner = inner.lock().unwrap();
+                // Invalidate the parent directory and clear any read cache for this file.
+                if let Some(parent_ino) = inner.inodes.find_parent_by_handle(*handle) {
+                    inner.dirs_loaded.remove(&parent_ino);
+                }
+                // Clear read cache entries for file handles pointing to this object.
+                let fhs_to_clear: Vec<u64> = inner
+                    .fh_to_inode
+                    .iter()
+                    .filter_map(|(&fh, &ino)| {
+                        inner.inodes.get(ino).and_then(|e| match &e.kind {
+                            InodeKind::File { handle: h } if *h == *handle => Some(fh),
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                for fh in fhs_to_clear {
+                    inner.read_cache.remove(&fh);
+                }
+            }
+            DeviceEvent::StoreAdded { .. }
+            | DeviceEvent::StoreRemoved { .. }
+            | DeviceEvent::StorageInfoChanged { .. } => {
+                debug!("Event: storage change {:?}", event);
+                // Storage-level changes: invalidate everything.
+                let mut inner = inner.lock().unwrap();
+                Self::invalidate_all_dirs(&mut inner);
+            }
+            _ => {
+                debug!("Event: unhandled {:?}", event);
+            }
+        }
+    }
+
+    /// Mark all cached directories as stale so they're re-fetched on next access.
+    fn invalidate_all_dirs(inner: &mut Inner) {
+        inner.dirs_loaded.retain(|&k, _| k == FUSE_ROOT_INODE);
+    }
 }
 
 impl Filesystem for MtpFs {
@@ -453,8 +544,20 @@ impl Filesystem for MtpFs {
         }
         inner.dirs_loaded.insert(FUSE_ROOT_INODE, true);
         inner.storages = storages;
+        drop(inner);
 
-        debug!("MtpFs initialized with {} storages", inner.storages.len());
+        // Spawn a background task that monitors device events and invalidates
+        // cached directory listings when objects are added, removed, or changed.
+        let event_device = self.event_device.clone();
+        let event_inner = Arc::clone(&self.inner);
+        self.rt.spawn(async move {
+            Self::event_loop(event_device, event_inner).await;
+        });
+
+        debug!(
+            "MtpFs initialized with {} storages + event monitor",
+            self.inner.lock().unwrap().storages.len()
+        );
         Ok(())
     }
 

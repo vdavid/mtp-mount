@@ -71,7 +71,7 @@ The FUSE layer translates filesystem calls into MTP operations:
 - **Reads** stream from the device to a temp file, then serve from disk (no full-file RAM buffering)
 - **Writes** buffer to a temp file, then flush to the device on close
 - **Overwrites** use a safe upload-then-delete-then-rename sequence when the device supports rename, so data is never lost if the upload fails
-- **Directory listings** are cached per session and refreshed on `opendir`
+- **Directory listings** are cached and refreshed on `opendir`. A background event monitor listens for device-side changes (files added, removed, or modified on the device itself) and invalidates the cache automatically
 
 ## Requirements
 
@@ -102,7 +102,7 @@ Integration tests mount a virtual MTP device via FUSE (Linux only, needs `libfus
 cargo test --test integration -- --ignored --test-threads=1
 ```
 
-All 43 tests (28 unit + 15 integration) pass on Linux. The integration tests
+All 45 tests (28 unit + 17 integration) pass on Linux. The integration tests
 use `mtp-rs`'s virtual device transport, so no physical device is needed.
 
 ## License

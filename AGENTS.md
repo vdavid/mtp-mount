@@ -32,10 +32,10 @@ tests/
 CLI (clap)
   |
 MtpFs (fuser::Filesystem)
-  |
-InodeTable + WriteBuffer
-  |
-mtp-rs (MtpDevice, Storage)
+  |                      \
+InodeTable + WriteBuffer  Event monitor (tokio task)
+  |                        |
+mtp-rs (MtpDevice, Storage + next_event)
 ```
 
 **Entry point:** `main.rs` parses CLI args, opens the MTP device via `mtp-rs`, and starts the FUSE session via `fuser`.
@@ -45,26 +45,26 @@ mtp-rs (MtpDevice, Storage)
 - **Writes** buffer to a temp file (`tempfile::tempfile()`), flushed to MTP on `release`.
 - **Overwrites** use upload-then-delete-then-rename when the device supports rename. Falls back to delete-then-upload otherwise (with a warning log).
 - **Async bridge:** fuser callbacks are sync, mtp-rs is async. Uses `tokio::runtime::Handle::block_on()` to bridge.
-- **Locking:** single `Mutex<Inner>` serializes all FUSE callbacks. Acceptable because fuser already serializes per-mount.
+- **Locking:** single `Arc<Mutex<Inner>>` serializes all FUSE callbacks. Shared with the event monitor task. Acceptable because fuser already serializes per-mount.
+- **Event monitoring:** A background tokio task polls `MtpDevice::next_event()` on a cloned device handle (cheap, Arc-backed). On `ObjectAdded`/`ObjectRemoved`/`ObjectInfoChanged` events, it invalidates the relevant directory's cache entry in `dirs_loaded`. For unknown objects (newly added on device), it invalidates all directories.
 
 ## Testing
 
 - **Unit tests** (28): inode table + write buffer, run with `cargo test`
-- **Integration tests** (15): mount a virtual MTP device via FUSE, exercise with `std::fs` operations. Linux only (needs `libfuse3-dev`). Run with `cargo test --test integration -- --ignored --test-threads=1`
+- **Integration tests** (17): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring. Linux only (needs `libfuse3-dev`). Run with `cargo test --test integration -- --ignored --test-threads=1`
 - All tests validated on Linux (Ubuntu, aarch64)
 
 ## Design principles
 
 - **Minimal**: correct POSIX subset, not everything
 - **No data loss**: safe flush sequence protects against upload failures
-- **Well-tested**: 43 tests, virtual device integration, no hardware needed
+- **Well-tested**: 45 tests, virtual device integration, no hardware needed
 
 ## Things to avoid
 
 - Complex caching strategies
 - Extended attributes, ACLs, or permission mapping
 - Hardlinks, symlinks (MTP doesn't support them)
-- Background polling threads
 
 ## CLI and --help
 
