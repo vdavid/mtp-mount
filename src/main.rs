@@ -86,10 +86,7 @@ fn list_devices() {
             for (i, dev) in devices.iter().enumerate() {
                 let mfr = dev.manufacturer.as_deref().unwrap_or("Unknown");
                 let product = dev.product.as_deref().unwrap_or("Unknown");
-                let serial = dev
-                    .serial_number
-                    .as_deref()
-                    .unwrap_or("(no serial)");
+                let serial = dev.serial_number.as_deref().unwrap_or("(no serial)");
                 println!(
                     "  [{}] {} {} (serial: {}, USB {:04x}:{:04x})",
                     i, mfr, product, serial, dev.vendor_id, dev.product_id
