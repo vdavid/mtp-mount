@@ -48,7 +48,7 @@ Run `mtp-mount --help` for the full list of options.
 
 ## Supported operations
 
-- **Read**: `cat`, `cp`, `head`, `less`, etc.
+- **Read**: `cat`, `cp`, `head`, `less`, random-access seeks (media scrubbing, `tail -c`, partial `dd`)
 - **Write**: create files, overwrite existing files
 - **Directories**: `ls`, `mkdir`, `rmdir`
 - **Delete**: `rm`
@@ -68,7 +68,7 @@ don't map:
 
 The FUSE layer translates filesystem calls into MTP operations:
 
-- **Reads** stream from the device to a temp file, then serve from disk (no full-file RAM buffering)
+- **Reads** are byte-range on-demand: each FUSE `read(offset, size)` fetches only the missing bytes via MTP's `GetPartialObject64`, writes them into a sparse tempfile, and serves the requested slice. Repeated reads of the same region hit the cache. Works with files larger than 4 GB.
 - **Writes** buffer to a temp file, then flush to the device on close
 - **Overwrites** use a safe upload-then-delete-then-rename sequence when the device supports rename, so data is never lost if the upload fails
 - **Directory listings** are cached and refreshed on `opendir`. A background event monitor listens for device-side changes (files added, removed, or modified on the device itself) and invalidates the cache automatically
@@ -102,7 +102,7 @@ Integration tests mount a virtual MTP device via FUSE (Linux only, needs `libfus
 cargo test --test integration -- --ignored --test-threads=1
 ```
 
-All 45 tests (28 unit + 17 integration) pass on Linux. The integration tests
+All 65 tests (43 unit + 22 integration) pass on Linux. The integration tests
 use `mtp-rs`'s virtual device transport, so no physical device is needed.
 
 ## License

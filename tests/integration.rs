@@ -10,6 +10,8 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use mtp_rs::mtp::MtpDevice;
@@ -25,6 +27,7 @@ use mtp_mount::fs::MtpFs;
 struct TestMount {
     mount_point: TempDir,
     backing_dir: TempDir,
+    fetch_counter: Arc<AtomicU64>,
     _session: fuser::BackgroundSession,
 }
 
@@ -78,6 +81,7 @@ impl TestMount {
             .expect("failed to open virtual device");
 
         let mtp_fs = MtpFs::new(device, false, handle);
+        let fetch_counter = mtp_fs.fetch_counter();
         let mount_options = mtp_fs.mount_options();
 
         let mut fuse_config = fuser::Config::default();
@@ -96,8 +100,14 @@ impl TestMount {
         TestMount {
             mount_point,
             backing_dir,
+            fetch_counter,
             _session: session,
         }
+    }
+
+    /// Current count of MTP partial-read fetches.
+    fn fetch_count(&self) -> u64 {
+        self.fetch_counter.load(Ordering::Relaxed)
     }
 
     /// Path to the FUSE mount point.
@@ -458,3 +468,162 @@ fn test_event_file_deleted_on_device() {
 // tracks file/directory creation and removal — content modifications don't change
 // the MTP object tree and real MTP devices are inconsistent about emitting
 // ObjectInfoChanged for content edits. See virtual_device/CLAUDE.md for details.
+
+// =============================================================================
+// Partial reads (sparse cache + download_partial_64)
+// =============================================================================
+
+/// Build a deterministic byte pattern: byte at position `i` equals `(i % 251) as u8`.
+/// 251 is prime so patterns don't align with typical power-of-two boundaries,
+/// making off-by-one bugs more likely to surface.
+fn pattern_byte(i: u64) -> u8 {
+    (i % 251) as u8
+}
+
+fn pattern_bytes(offset: u64, len: usize) -> Vec<u8> {
+    (0..len as u64).map(|i| pattern_byte(offset + i)).collect()
+}
+
+#[test]
+#[ignore]
+fn test_read_at_arbitrary_offset() {
+    const FILE_SIZE: usize = 3 * 1024 * 1024; // 3 MB
+    let mount = TestMount::with_setup(|backing| {
+        let data: Vec<u8> = (0..FILE_SIZE).map(|i| pattern_byte(i as u64)).collect();
+        fs::write(backing.join("pattern.bin"), data).unwrap();
+    });
+
+    let path = mount.storage_path().join("pattern.bin");
+    let file = fs::File::open(&path).expect("open failed");
+
+    // Read from the middle of the file, past the first USB-chunk boundary.
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = file;
+    file.seek(SeekFrom::Start(2_000_000)).expect("seek failed");
+    let mut buf = vec![0u8; 1024];
+    file.read_exact(&mut buf).expect("read failed");
+
+    assert_eq!(buf, pattern_bytes(2_000_000, 1024));
+}
+
+#[test]
+#[ignore]
+fn test_seek_pattern_video_scrub() {
+    // Simulate a media player scrubbing around a file: jump around, read small bursts.
+    const FILE_SIZE: usize = 5 * 1024 * 1024; // 5 MB
+    let mount = TestMount::with_setup(|backing| {
+        let data: Vec<u8> = (0..FILE_SIZE).map(|i| pattern_byte(i as u64)).collect();
+        fs::write(backing.join("video.bin"), data).unwrap();
+    });
+
+    let path = mount.storage_path().join("video.bin");
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = fs::File::open(&path).expect("open failed");
+
+    let offsets: [u64; 5] = [0, 4_500_000, 1_500_000, 4_500_000, 2_500_000];
+    for &offset in &offsets {
+        file.seek(SeekFrom::Start(offset)).expect("seek failed");
+        let mut buf = vec![0u8; 4096];
+        file.read_exact(&mut buf).expect("read failed");
+        assert_eq!(buf, pattern_bytes(offset, 4096), "mismatch at {offset}");
+    }
+}
+
+#[test]
+#[ignore]
+fn test_cache_prevents_refetch() {
+    const FILE_SIZE: usize = 2 * 1024 * 1024;
+    let mount = TestMount::with_setup(|backing| {
+        let data: Vec<u8> = (0..FILE_SIZE).map(|i| pattern_byte(i as u64)).collect();
+        fs::write(backing.join("cached.bin"), data).unwrap();
+    });
+
+    let path = mount.storage_path().join("cached.bin");
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = fs::File::open(&path).expect("open failed");
+
+    // First read populates the cache.
+    file.seek(SeekFrom::Start(500_000)).expect("seek failed");
+    let mut buf = vec![0u8; 10_000];
+    file.read_exact(&mut buf).expect("read failed");
+    let after_first = mount.fetch_count();
+    assert!(after_first > 0, "expected at least one fetch on first read");
+
+    // Second read of an overlapping range (fully covered by first) should not refetch.
+    file.seek(SeekFrom::Start(505_000)).expect("seek failed");
+    let mut buf = vec![0u8; 5000];
+    file.read_exact(&mut buf).expect("read failed");
+    assert_eq!(
+        mount.fetch_count(),
+        after_first,
+        "overlapping re-read should hit cache"
+    );
+
+    // Re-reading the exact same range should also not refetch.
+    file.seek(SeekFrom::Start(500_000)).expect("seek failed");
+    let mut buf = vec![0u8; 10_000];
+    file.read_exact(&mut buf).expect("read failed");
+    assert_eq!(
+        mount.fetch_count(),
+        after_first,
+        "identical re-read should hit cache"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_full_sequential_read() {
+    // Regression check: reading a whole file sequentially (`cat`, `cp`) still works.
+    const FILE_SIZE: usize = 1_000_000;
+    let mount = TestMount::with_setup(|backing| {
+        let data: Vec<u8> = (0..FILE_SIZE).map(|i| pattern_byte(i as u64)).collect();
+        fs::write(backing.join("seq.bin"), data).unwrap();
+    });
+
+    let read = fs::read(mount.storage_path().join("seq.bin")).expect("read failed");
+    assert_eq!(read.len(), FILE_SIZE);
+    assert_eq!(read, pattern_bytes(0, FILE_SIZE));
+}
+
+#[test]
+#[ignore]
+fn test_read_large_file_past_4gb() {
+    // Files larger than 4 GB require GetPartialObject64. We create a sparse file
+    // on the backing dir (takes almost no disk space) and read bytes from near
+    // the start and past the 4 GB boundary.
+    const FILE_SIZE: u64 = 5 * 1024 * 1024 * 1024; // 5 GB
+    const BOUNDARY: u64 = 4 * 1024 * 1024 * 1024 + 1024; // just past the 32-bit limit
+
+    // Write a known pattern at two specific offsets in the otherwise-sparse file.
+    let mount = TestMount::with_setup(|backing| {
+        let path = backing.join("big.bin");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(FILE_SIZE).unwrap();
+
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+
+        file.seek(SeekFrom::Start(1000)).unwrap();
+        file.write_all(&pattern_bytes(1000, 256)).unwrap();
+
+        file.seek(SeekFrom::Start(BOUNDARY)).unwrap();
+        file.write_all(&pattern_bytes(BOUNDARY, 256)).unwrap();
+    });
+
+    let path = mount.storage_path().join("big.bin");
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = fs::File::open(&path).expect("open failed");
+
+    // Read near the start.
+    file.seek(SeekFrom::Start(1000)).expect("seek failed");
+    let mut buf = vec![0u8; 256];
+    file.read_exact(&mut buf).expect("read near start failed");
+    assert_eq!(buf, pattern_bytes(1000, 256));
+
+    // Read past the 32-bit boundary — this is what GetPartialObject64 enables.
+    file.seek(SeekFrom::Start(BOUNDARY)).expect("seek failed");
+    let mut buf = vec![0u8; 256];
+    file.read_exact(&mut buf)
+        .expect("read past 4 GB boundary failed");
+    assert_eq!(buf, pattern_bytes(BOUNDARY, 256));
+}

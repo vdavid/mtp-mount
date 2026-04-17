@@ -16,14 +16,15 @@ FUSE filesystem that mounts MTP devices (Android phones, cameras) as local direc
 
 ```
 src/
-  main.rs    # CLI entry point (clap)
-  lib.rs     # Module re-exports for integration tests
-  fs.rs      # MtpFs: implements fuser::Filesystem
-  inode.rs   # Inode table: maps FUSE inodes <-> MTP object handles
-  buffer.rs  # Write buffer: temp-file-backed, flushes to MTP on close
-  error.rs   # MountError enum
+  main.rs          # CLI entry point (clap)
+  lib.rs           # Module re-exports for integration tests
+  fs.rs            # MtpFs: implements fuser::Filesystem
+  inode.rs         # Inode table: maps FUSE inodes <-> MTP object handles
+  buffer.rs        # Write buffer: temp-file-backed, flushes to MTP on close
+  sparse_cache.rs  # Byte-range cache for on-demand partial reads
+  error.rs         # MountError enum
 tests/
-  integration.rs  # FUSE mount tests against mtp-rs virtual device
+  integration.rs   # FUSE mount tests against mtp-rs virtual device
 ```
 
 ## Architecture
@@ -41,7 +42,7 @@ mtp-rs (MtpDevice, Storage + next_event)
 **Entry point:** `main.rs` parses CLI args, opens the MTP device via `mtp-rs`, and starts the FUSE session via `fuser`.
 
 **Key design choices:**
-- **Reads** stream from MTP to a temp file via `download_stream`, then serve FUSE reads from disk. No full-file RAM buffering.
+- **Reads** are byte-range on-demand via `download_partial_64`. Each open file handle has a `SparseCache` (tempfile + sorted `Vec<Range<u64>>` of populated ranges). FUSE `read(offset, size)` asks the cache for missing ranges, fetches them in 1 MB chunks, writes them into the tempfile, and serves the requested slice. No full-file download on open; supports files > 4 GB.
 - **Writes** buffer to a temp file (`tempfile::tempfile()`), flushed to MTP on `release`.
 - **Overwrites** use upload-then-delete-then-rename when the device supports rename. Falls back to delete-then-upload otherwise (with a warning log).
 - **Async bridge:** fuser callbacks are sync, mtp-rs is async. Uses `tokio::runtime::Handle::block_on()` to bridge.
@@ -50,15 +51,15 @@ mtp-rs (MtpDevice, Storage + next_event)
 
 ## Testing
 
-- **Unit tests** (28): inode table + write buffer, run with `cargo test`
-- **Integration tests** (17): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring. Linux only (needs `libfuse3-dev`). Run with `cargo test --test integration -- --ignored --test-threads=1`
+- **Unit tests** (43): inode table, write buffer, sparse cache. Run with `cargo test`.
+- **Integration tests** (22): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring and partial reads (>4 GB sparse files). Linux only (needs `libfuse3-dev`). Run with `cargo test --test integration -- --ignored --test-threads=1`
 - All tests validated on Linux (Ubuntu, aarch64)
 
 ## Design principles
 
 - **Minimal**: correct POSIX subset, not everything
 - **No data loss**: safe flush sequence protects against upload failures
-- **Well-tested**: 45 tests, virtual device integration, no hardware needed
+- **Well-tested**: 65 tests, virtual device integration, no hardware needed
 
 ## Things to avoid
 

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
-use std::io::{Read as _, Seek, SeekFrom, Write as _};
+use std::io::{Seek, SeekFrom};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -19,6 +19,7 @@ use mtp_rs::{NewObjectInfo, ObjectHandle, Storage};
 
 use crate::buffer::WriteBuffer;
 use crate::inode::{InodeEntry, InodeKind, InodeTable, FUSE_ROOT_INODE};
+use crate::sparse_cache::SparseCache;
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -108,7 +109,7 @@ struct Inner {
     storages: Vec<Storage>,
     inodes: InodeTable,
     write_buf: WriteBuffer,
-    read_cache: HashMap<u64, std::fs::File>,
+    read_cache: HashMap<u64, SparseCache>,
     dirs_loaded: HashMap<u64, bool>,
     fh_to_inode: HashMap<u64, u64>,
 }
@@ -122,6 +123,9 @@ pub struct MtpFs {
     inner: Arc<Mutex<Inner>>,
     next_fh: AtomicU64,
     read_only: bool,
+    /// Counter incremented on every MTP partial-read fetch. Used by integration
+    /// tests to verify that the sparse cache prevents redundant fetches.
+    fetch_counter: Arc<AtomicU64>,
 }
 
 impl MtpFs {
@@ -141,7 +145,16 @@ impl MtpFs {
             })),
             next_fh: AtomicU64::new(1),
             read_only,
+            fetch_counter: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Returns a shared handle to the MTP fetch counter.
+    ///
+    /// The counter increments each time a partial-read operation is issued to
+    /// the device. Primarily used by integration tests to verify cache behavior.
+    pub fn fetch_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.fetch_counter)
     }
 
     fn alloc_fh(&self) -> u64 {
@@ -674,7 +687,6 @@ impl Filesystem for MtpFs {
         }
     }
 
-    #[allow(clippy::map_entry)] // entry API doesn't fit: download + error handling between check and insert
     fn read(
         &self,
         _req: &Request,
@@ -701,96 +713,92 @@ impl Filesystem for MtpFs {
             return;
         }
 
-        // Download and cache if not already cached.
-        if !inner.read_cache.contains_key(&fh_val) {
-            let entry = match inner.inodes.get(ino.0) {
-                Some(e) => e,
-                None => {
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
-            };
+        // Resolve the MTP object and its storage.
+        let entry = match inner.inodes.get(ino.0) {
+            Some(e) => e.clone(),
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
 
-            let handle = match &entry.kind {
-                InodeKind::File { handle } => *handle,
-                _ => {
-                    reply.error(Errno::EISDIR);
-                    return;
-                }
-            };
+        let handle = match &entry.kind {
+            InodeKind::File { handle } => *handle,
+            _ => {
+                reply.error(Errno::EISDIR);
+                return;
+            }
+        };
 
-            let storage_idx = match Self::find_storage_index(&inner, ino.0) {
-                Some(i) => i,
-                None => {
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            };
-
-            let mut download: mtp_rs::FileDownload = match self
-                .rt
-                .block_on(inner.storages[storage_idx].download_stream(handle))
-            {
-                Ok(d) => d,
-                Err(e) => {
-                    error!("MTP download_stream failed: {e}");
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            };
-
-            let mut file = match tempfile::tempfile() {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("Failed to create temp file: {e}");
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            };
-
-            let write_ok = self.rt.block_on(async {
-                while let Some(chunk_result) = download.next_chunk().await {
-                    let bytes: Bytes = match chunk_result {
-                        Ok(b) => b,
-                        Err(e) => {
-                            error!("MTP download chunk failed: {e}");
-                            return false;
-                        }
-                    };
-                    if let Err(e) = file.write_all(&bytes) {
-                        error!("Failed to write to temp file: {e}");
-                        return false;
-                    }
-                }
-                true
-            });
-
-            if !write_ok {
+        let storage_idx = match Self::find_storage_index(&inner, ino.0) {
+            Some(i) => i,
+            None => {
                 reply.error(Errno::EIO);
                 return;
             }
+        };
 
-            inner.read_cache.insert(fh_val, file);
+        // Lazily create a sparse cache for this file handle.
+        if !inner.read_cache.contains_key(&fh_val) {
+            let cache = match SparseCache::new(entry.size) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to create sparse cache: {e}");
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
+            inner.read_cache.insert(fh_val, cache);
         }
 
-        let file = inner.read_cache.get_mut(&fh_val).unwrap();
-        let file_size = file.seek(SeekFrom::End(0)).unwrap_or(0);
-        if offset >= file_size {
-            reply.data(&[]);
-        } else {
-            let read_len = (size as u64).min(file_size - offset) as usize;
-            let mut buf = vec![0u8; read_len];
-            if let Err(e) = file.seek(SeekFrom::Start(offset)) {
-                error!("Seek failed: {e}");
-                reply.error(Errno::EIO);
-                return;
-            }
-            match file.read_exact(&mut buf) {
-                Ok(()) => reply.data(&buf),
-                Err(e) => {
-                    error!("Read from temp file failed: {e}");
+        // Figure out which byte ranges still need to be fetched from MTP.
+        let missing = {
+            let cache = inner.read_cache.get(&fh_val).unwrap();
+            cache.missing_ranges(offset, size as u64)
+        };
+
+        // Fetch missing ranges. Uses the 64-bit partial-read op to support
+        // offsets beyond 4 GB. Each USB transfer is capped at 1 MB to keep
+        // latency reasonable.
+        const CHUNK: u64 = 1024 * 1024;
+        for range in missing {
+            let mut cursor = range.start;
+            while cursor < range.end {
+                let chunk_size = (range.end - cursor).min(CHUNK) as u32;
+                self.fetch_counter.fetch_add(1, Ordering::Relaxed);
+                let bytes = match self.rt.block_on(
+                    inner.storages[storage_idx].download_partial_64(handle, cursor, chunk_size),
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!("MTP download_partial_64 failed at offset {cursor}: {e}");
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                };
+                let bytes_len = bytes.len() as u64;
+                let cache = inner.read_cache.get_mut(&fh_val).unwrap();
+                if let Err(e) = cache.write_at(cursor, &bytes) {
+                    error!("Sparse cache write failed: {e}");
                     reply.error(Errno::EIO);
+                    return;
                 }
+                // Short read from device — the object is smaller than reported;
+                // stop fetching to avoid an infinite loop.
+                if bytes_len == 0 {
+                    break;
+                }
+                cursor += bytes_len;
+            }
+        }
+
+        // Serve the requested slice from the cache.
+        let cache = inner.read_cache.get_mut(&fh_val).unwrap();
+        match cache.read_at(offset, size as u64) {
+            Ok(buf) => reply.data(&buf),
+            Err(e) => {
+                error!("Sparse cache read failed: {e}");
+                reply.error(Errno::EIO);
             }
         }
     }
