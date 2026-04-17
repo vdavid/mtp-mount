@@ -4,12 +4,14 @@
 
 # mtp-mount
 
-Mount MTP devices as local filesystems via FUSE.
+Mount MTP devices as local filesystems via FUSE. This is pure Rust, _not_ built
+on [libmtp](https://github.com/libmtp/libmtp/).
 
-Plug in your Android phone or camera, run `mtp-mount /mnt/phone`, and use
-`ls`, `cp`, `cat`, `rm`, etc. on your device's storage. Built on
-[`mtp-rs`](https://crates.io/crates/mtp-rs) (pure Rust, no libmtp) and
-[`fuser`](https://crates.io/crates/fuser).
+To use it, plug in your Android phone or camera, run `mtp-mount /mnt/phone`, and use `ls`, `cp`, `cat`, `rm`, `mv`
+on the device's storage like you would on any local directory.
+
+Built on [`mtp-rs`](https://crates.io/crates/mtp-rs) (pure-Rust MTP stack) and [
+`fuser`](https://crates.io/crates/fuser).
 
 ## Install
 
@@ -19,19 +21,25 @@ cargo install mtp-mount
 
 ## Usage
 
-Mount the first available MTP device:
+List connected devices:
+
+```sh
+mtp-mount --list
+```
+
+Mount the first available device:
 
 ```sh
 mtp-mount /mnt/phone
 ```
 
-Pick a specific device by serial number:
+Or pick a specific device by serial number:
 
 ```sh
 mtp-mount -d SERIAL /mnt/phone
 ```
 
-Mount read-only:
+Mount read-only (safer for browsing, you'll make no accidental deletes):
 
 ```sh
 mtp-mount -r /mnt/phone
@@ -40,38 +48,44 @@ mtp-mount -r /mnt/phone
 Unmount:
 
 ```sh
-umount /mnt/phone           # Linux
+umount /mnt/phone            # Linux
 diskutil unmount /mnt/phone  # macOS
 ```
 
-Run `mtp-mount --help` for the full list of options.
+Run `mtp-mount --help` for the full list of flags, examples, and troubleshooting tips.
 
-## Supported operations
+## What works
 
-- **Read**: `cat`, `cp`, `head`, `less`, random-access seeks (media scrubbing, `tail -c`, partial `dd`)
+- **Read**: `cat`, `cp`, `head`, `less`, and random-access seeks (media scrubbing, `tail -c`, partial `dd`)
 - **Write**: create files, overwrite existing files
 - **Directories**: `ls`, `mkdir`, `rmdir`
 - **Delete**: `rm`
-- **Rename/move**: `mv`
+- **Rename and move**: `mv`
+- **Large files**: files larger than 4 GB read end-to-end (no 32-bit truncation)
 
-## Not supported
+## What doesn't (and why)
 
-MTP is an object-based protocol, not a block device. Some POSIX features
-don't map:
+MTP is an object-based protocol, not a block device, so some POSIX features just don't map:
 
-- Hardlinks and symlinks
-- File permissions (`chmod`/`chown` are no-ops, everything shows as 0644/0755)
+- Hardlinks and symlinks (MTP has no concept of them)
+- File permissions: `chmod` and `chown` are no-ops, everything shows as `0644`/`0755`
 - Extended attributes
-- Sparse files or random-access writes (files are uploaded whole on close)
+- Sparse files and random-access writes: files are uploaded whole on close
 
 ## How it works
 
 The FUSE layer translates filesystem calls into MTP operations:
 
-- **Reads** are byte-range on-demand: each FUSE `read(offset, size)` fetches only the missing bytes via MTP's `GetPartialObject64`, writes them into a sparse tempfile, and serves the requested slice. Repeated reads of the same region hit the cache. Works with files larger than 4 GB.
-- **Writes** buffer to a temp file, then flush to the device on close
-- **Overwrites** use a safe upload-then-delete-then-rename sequence when the device supports rename, so data is never lost if the upload fails
-- **Directory listings** are cached and refreshed on `opendir`. A background event monitor listens for device-side changes (files added, removed, or modified on the device itself) and invalidates the cache automatically
+- **Reads are byte-range on-demand.** Each FUSE `read(offset, size)` fetches only the missing bytes via MTP's
+  `GetPartialObject64`, writes them into a sparse tempfile, and serves the requested slice. Repeated reads of the same
+  region hit the local cache. Scrubbing a 10 GB video only downloads what you actually touch.
+- **Writes buffer to a tempfile**, then flush to the device on close.
+- **Overwrites use a safe upload-then-delete-then-rename sequence** when the device supports rename. So if the upload
+  fails, the original is still there. Falls back to delete-then-upload with a warning log on devices that don't support
+  rename.
+- **Directory listings are cached** and refreshed on `opendir`. A background event monitor watches
+  `MtpDevice::next_event()` and invalidates entries when files are added, removed, or modified on the device itself (so
+  taking a photo while the phone is mounted just shows up).
 
 ## Requirements
 
@@ -102,8 +116,8 @@ Integration tests mount a virtual MTP device via FUSE (Linux only, needs `libfus
 cargo test --test integration -- --ignored --test-threads=1
 ```
 
-All 63 tests (42 unit + 21 integration) pass on Linux. The integration tests
-use `mtp-rs`'s virtual device transport, so no physical device is needed.
+65 tests total (44 unit + 21 integration), all passing on Linux. The integration tests use `mtp-rs`'s virtual device
+transport, so CI runs without any physical hardware.
 
 ## License
 
