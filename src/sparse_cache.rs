@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn missing_ranges_full_hit() {
         let mut cache = SparseCache::new(1000).unwrap();
-        cache.write_at(0, &vec![0u8; 500]).unwrap();
+        cache.write_at(0, &[0u8; 500]).unwrap();
         assert_eq!(cache.missing_ranges(100, 200), Vec::<Range<u64>>::new());
         assert_eq!(cache.missing_ranges(0, 500), Vec::<Range<u64>>::new());
     }
@@ -155,7 +155,7 @@ mod tests {
     fn missing_ranges_partial_hit_at_start() {
         let mut cache = SparseCache::new(1000).unwrap();
         // Populate [0, 100).
-        cache.write_at(0, &vec![0u8; 100]).unwrap();
+        cache.write_at(0, &[0u8; 100]).unwrap();
         // Request [0, 200) — first 100 cached, 100..200 missing.
         assert_eq!(cache.missing_ranges(0, 200), vec![100..200]);
     }
@@ -164,7 +164,7 @@ mod tests {
     fn missing_ranges_partial_hit_at_end() {
         let mut cache = SparseCache::new(1000).unwrap();
         // Populate [100, 200).
-        cache.write_at(100, &vec![0u8; 100]).unwrap();
+        cache.write_at(100, &[0u8; 100]).unwrap();
         // Request [0, 200) — first 100 missing, last 100 cached.
         assert_eq!(cache.missing_ranges(0, 200), vec![0..100]);
     }
@@ -172,8 +172,8 @@ mod tests {
     #[test]
     fn missing_ranges_gap_in_middle() {
         let mut cache = SparseCache::new(1000).unwrap();
-        cache.write_at(0, &vec![0u8; 100]).unwrap();
-        cache.write_at(200, &vec![0u8; 100]).unwrap();
+        cache.write_at(0, &[0u8; 100]).unwrap();
+        cache.write_at(200, &[0u8; 100]).unwrap();
         // Request [0, 300) — gap at [100, 200).
         assert_eq!(cache.missing_ranges(0, 300), vec![100..200]);
     }
@@ -181,8 +181,8 @@ mod tests {
     #[test]
     fn missing_ranges_multiple_gaps() {
         let mut cache = SparseCache::new(1000).unwrap();
-        cache.write_at(100, &vec![0u8; 50]).unwrap();
-        cache.write_at(300, &vec![0u8; 50]).unwrap();
+        cache.write_at(100, &[0u8; 50]).unwrap();
+        cache.write_at(300, &[0u8; 50]).unwrap();
         // Request [0, 400) — gaps at [0,100), [150,300), [350,400).
         assert_eq!(
             cache.missing_ranges(0, 400),
@@ -195,7 +195,7 @@ mod tests {
         let mut cache = SparseCache::new(500).unwrap();
         // Request extends beyond total_size; should clip.
         assert_eq!(cache.missing_ranges(400, 1000), vec![400..500]);
-        cache.write_at(400, &vec![0u8; 100]).unwrap();
+        cache.write_at(400, &[0u8; 100]).unwrap();
         assert_eq!(cache.missing_ranges(400, 1000), Vec::<Range<u64>>::new());
     }
 
@@ -208,33 +208,33 @@ mod tests {
     #[test]
     fn adjacent_ranges_merge() {
         let mut cache = SparseCache::new(1000).unwrap();
-        cache.write_at(0, &vec![0u8; 100]).unwrap();
-        cache.write_at(100, &vec![0u8; 100]).unwrap();
-        assert_eq!(cache.populated_ranges(), &[0..200]);
+        cache.write_at(0, &[0u8; 100]).unwrap();
+        cache.write_at(100, &[0u8; 100]).unwrap();
+        assert_eq!(cache.populated_ranges(), [0u64..200].as_slice());
     }
 
     #[test]
     fn overlapping_ranges_merge() {
         let mut cache = SparseCache::new(1000).unwrap();
-        cache.write_at(0, &vec![0u8; 100]).unwrap();
-        cache.write_at(50, &vec![0u8; 100]).unwrap();
-        assert_eq!(cache.populated_ranges(), &[0..150]);
+        cache.write_at(0, &[0u8; 100]).unwrap();
+        cache.write_at(50, &[0u8; 100]).unwrap();
+        assert_eq!(cache.populated_ranges(), [0u64..150].as_slice());
     }
 
     #[test]
     fn disjoint_ranges_preserved() {
         let mut cache = SparseCache::new(1000).unwrap();
-        cache.write_at(0, &vec![0u8; 100]).unwrap();
-        cache.write_at(500, &vec![0u8; 100]).unwrap();
+        cache.write_at(0, &[0u8; 100]).unwrap();
+        cache.write_at(500, &[0u8; 100]).unwrap();
         assert_eq!(cache.populated_ranges(), &[0..100, 500..600]);
     }
 
     #[test]
     fn insertion_sorted() {
         let mut cache = SparseCache::new(1000).unwrap();
-        cache.write_at(500, &vec![0u8; 100]).unwrap();
-        cache.write_at(0, &vec![0u8; 100]).unwrap();
-        cache.write_at(300, &vec![0u8; 50]).unwrap();
+        cache.write_at(500, &[0u8; 100]).unwrap();
+        cache.write_at(0, &[0u8; 100]).unwrap();
+        cache.write_at(300, &[0u8; 50]).unwrap();
         assert_eq!(cache.populated_ranges(), &[0..100, 300..350, 500..600]);
     }
 
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn read_at_clips_to_total_size() {
         let mut cache = SparseCache::new(150).unwrap();
-        cache.write_at(100, &vec![0u8; 50]).unwrap();
+        cache.write_at(100, &[0u8; 50]).unwrap();
         // Request extends past total_size; should return only the available bytes.
         let read = cache.read_at(100, 200).unwrap();
         assert_eq!(read.len(), 50);
@@ -267,9 +267,9 @@ mod tests {
     fn three_way_merge() {
         // Writing a range that bridges two existing ranges should merge all three.
         let mut cache = SparseCache::new(1000).unwrap();
-        cache.write_at(0, &vec![0u8; 100]).unwrap();
-        cache.write_at(200, &vec![0u8; 100]).unwrap();
-        cache.write_at(100, &vec![0u8; 100]).unwrap();
-        assert_eq!(cache.populated_ranges(), &[0..300]);
+        cache.write_at(0, &[0u8; 100]).unwrap();
+        cache.write_at(200, &[0u8; 100]).unwrap();
+        cache.write_at(100, &[0u8; 100]).unwrap();
+        assert_eq!(cache.populated_ranges(), [0u64..300].as_slice());
     }
 }
