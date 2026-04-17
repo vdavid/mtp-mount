@@ -10,9 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Partial reads**: FUSE reads now fetch only the requested byte ranges via MTP's `GetPartialObject64`, backed by a per-handle sparse cache. Opening a large file no longer triggers a full download. Supports files larger than 4 GB. Random-access patterns (media scrubbing, `tail -c`, seeking) work without re-downloading populated regions.
-- `SparseCache` module (byte-range tracking + tempfile-backed storage, 15 unit tests)
+- `SparseCache` module (byte-range tracking + tempfile-backed storage, 14 unit tests)
 - `MtpFs::fetch_counter()` for integration tests to verify cache behavior
-- 5 new integration tests covering arbitrary-offset reads, video-scrub seek patterns, cache re-read suppression, full sequential reads, and files past the 4 GB boundary (sparse backing)
+- 4 new integration tests covering arbitrary-offset reads, video-scrub seek patterns, cache re-read suppression, and full sequential reads. Files larger than 4 GB are validated end-to-end via mtp-rs's real-device test (virtual device caps `ObjectInfo` size at `u32::MAX`).
 
 ### Changed
 

@@ -36,11 +36,6 @@ impl SparseCache {
         })
     }
 
-    /// Total size of the underlying object, as reported by MTP.
-    pub fn total_size(&self) -> u64 {
-        self.total_size
-    }
-
     /// Returns the byte ranges within `[offset, offset+size)` that are NOT yet populated.
     ///
     /// The returned ranges are sorted and clipped to `[0, total_size)`.
@@ -266,12 +261,6 @@ mod tests {
         let mut cache = SparseCache::new(100).unwrap();
         let read = cache.read_at(200, 50).unwrap();
         assert_eq!(read, Vec::<u8>::new());
-    }
-
-    #[test]
-    fn total_size_reported() {
-        let cache = SparseCache::new(1234).unwrap();
-        assert_eq!(cache.total_size(), 1234);
     }
 
     #[test]

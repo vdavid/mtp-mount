@@ -102,7 +102,7 @@ Integration tests mount a virtual MTP device via FUSE (Linux only, needs `libfus
 cargo test --test integration -- --ignored --test-threads=1
 ```
 
-All 65 tests (43 unit + 22 integration) pass on Linux. The integration tests
+All 63 tests (42 unit + 21 integration) pass on Linux. The integration tests
 use `mtp-rs`'s virtual device transport, so no physical device is needed.
 
 ## License

@@ -51,15 +51,15 @@ mtp-rs (MtpDevice, Storage + next_event)
 
 ## Testing
 
-- **Unit tests** (43): inode table, write buffer, sparse cache. Run with `cargo test`.
-- **Integration tests** (22): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring and partial reads (>4 GB sparse files). Linux only (needs `libfuse3-dev`). Run with `cargo test --test integration -- --ignored --test-threads=1`
+- **Unit tests** (42): inode table, write buffer, sparse cache. Run with `cargo test`.
+- **Integration tests** (21): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring and partial reads. Linux only (needs `libfuse3-dev`). Run with `cargo test --test integration -- --ignored --test-threads=1`
 - All tests validated on Linux (Ubuntu, aarch64)
 
 ## Design principles
 
 - **Minimal**: correct POSIX subset, not everything
 - **No data loss**: safe flush sequence protects against upload failures
-- **Well-tested**: 65 tests, virtual device integration, no hardware needed
+- **Well-tested**: 63 tests, virtual device integration, no hardware needed
 
 ## Things to avoid
 

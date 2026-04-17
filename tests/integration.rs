@@ -585,45 +585,7 @@ fn test_full_sequential_read() {
     assert_eq!(read, pattern_bytes(0, FILE_SIZE));
 }
 
-#[test]
-#[ignore]
-fn test_read_large_file_past_4gb() {
-    // Files larger than 4 GB require GetPartialObject64. We create a sparse file
-    // on the backing dir (takes almost no disk space) and read bytes from near
-    // the start and past the 4 GB boundary.
-    const FILE_SIZE: u64 = 5 * 1024 * 1024 * 1024; // 5 GB
-    const BOUNDARY: u64 = 4 * 1024 * 1024 * 1024 + 1024; // just past the 32-bit limit
-
-    // Write a known pattern at two specific offsets in the otherwise-sparse file.
-    let mount = TestMount::with_setup(|backing| {
-        let path = backing.join("big.bin");
-        let file = fs::File::create(&path).unwrap();
-        file.set_len(FILE_SIZE).unwrap();
-
-        use std::io::{Seek as _, SeekFrom, Write as _};
-        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
-
-        file.seek(SeekFrom::Start(1000)).unwrap();
-        file.write_all(&pattern_bytes(1000, 256)).unwrap();
-
-        file.seek(SeekFrom::Start(BOUNDARY)).unwrap();
-        file.write_all(&pattern_bytes(BOUNDARY, 256)).unwrap();
-    });
-
-    let path = mount.storage_path().join("big.bin");
-    use std::io::{Read as _, Seek as _, SeekFrom};
-    let mut file = fs::File::open(&path).expect("open failed");
-
-    // Read near the start.
-    file.seek(SeekFrom::Start(1000)).expect("seek failed");
-    let mut buf = vec![0u8; 256];
-    file.read_exact(&mut buf).expect("read near start failed");
-    assert_eq!(buf, pattern_bytes(1000, 256));
-
-    // Read past the 32-bit boundary — this is what GetPartialObject64 enables.
-    file.seek(SeekFrom::Start(BOUNDARY)).expect("seek failed");
-    let mut buf = vec![0u8; 256];
-    file.read_exact(&mut buf)
-        .expect("read past 4 GB boundary failed");
-    assert_eq!(buf, pattern_bytes(BOUNDARY, 256));
-}
+// Note: files larger than 4 GB can't be tested via the virtual device because
+// the virtual device's ObjectInfo builder truncates size to u32::MAX.
+// The >4GB path (GetPartialObject64 with 64-bit offsets) was validated end-to-end
+// on a real Pixel 9 Pro XL with an 8 GB MKV via mtp-rs's examples/test_partial_download_64.rs.

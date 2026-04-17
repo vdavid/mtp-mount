@@ -153,6 +153,7 @@ impl MtpFs {
     ///
     /// The counter increments each time a partial-read operation is issued to
     /// the device. Primarily used by integration tests to verify cache behavior.
+    #[allow(dead_code)] // used by integration tests via lib.rs, not by the bin
     pub fn fetch_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.fetch_counter)
     }
