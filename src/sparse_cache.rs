@@ -133,6 +133,7 @@ impl SparseCache {
 }
 
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)] // intentional: asserting populated_ranges matches a one-range slice
 mod tests {
     use super::*;
 
@@ -210,7 +211,7 @@ mod tests {
         let mut cache = SparseCache::new(1000).unwrap();
         cache.write_at(0, &[0u8; 100]).unwrap();
         cache.write_at(100, &[0u8; 100]).unwrap();
-        assert_eq!(cache.populated_ranges(), [0u64..200].as_slice());
+        assert_eq!(cache.populated_ranges(), &[0..200]);
     }
 
     #[test]
@@ -218,7 +219,7 @@ mod tests {
         let mut cache = SparseCache::new(1000).unwrap();
         cache.write_at(0, &[0u8; 100]).unwrap();
         cache.write_at(50, &[0u8; 100]).unwrap();
-        assert_eq!(cache.populated_ranges(), [0u64..150].as_slice());
+        assert_eq!(cache.populated_ranges(), &[0..150]);
     }
 
     #[test]
@@ -270,6 +271,6 @@ mod tests {
         cache.write_at(0, &[0u8; 100]).unwrap();
         cache.write_at(200, &[0u8; 100]).unwrap();
         cache.write_at(100, &[0u8; 100]).unwrap();
-        assert_eq!(cache.populated_ranges(), [0u64..300].as_slice());
+        assert_eq!(cache.populated_ranges(), &[0..300]);
     }
 }
