@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-04-17
+
+### Fixed
+
+- **Files larger than 4 GB are now fully readable.** Previous releases truncated file sizes to `u32::MAX` (the standard MTP `ObjectInfo` limit), which caused the FUSE kernel to short-circuit reads past the 4 GB mark. This release picks up mtp-rs 0.13.1, which auto-resolves the real u64 size via `GetObjectPropValue(ObjectSize)`.
+
+### Changed
+
+- Updated to mtp-rs 0.13.1
+
 ## [0.3.0] - 2026-04-17
 
 ### Added

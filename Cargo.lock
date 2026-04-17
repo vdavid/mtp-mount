@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "mtp-mount"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "assert_cmd",
  "bytes",
@@ -609,9 +609,9 @@ dependencies = [
 
 [[package]]
 name = "mtp-rs"
-version = "0.13.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "071d93a07496aa75eec879d138175b3ce15cbfa16c9e83d3ded2afaad7a80de2"
+checksum = "52c6d02fdc2efca1e73b548c8852b748cd741079acccb26149634cf708083c98"
 dependencies = [
  "async-trait",
  "bytes",
