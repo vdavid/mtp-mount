@@ -739,7 +739,8 @@ impl Filesystem for MtpFs {
         };
 
         // Lazily create a sparse cache for this file handle.
-        if !inner.read_cache.contains_key(&fh_val) {
+        use std::collections::hash_map::Entry;
+        if let Entry::Vacant(slot) = inner.read_cache.entry(fh_val) {
             let cache = match SparseCache::new(entry.size) {
                 Ok(c) => c,
                 Err(e) => {
@@ -748,7 +749,7 @@ impl Filesystem for MtpFs {
                     return;
                 }
             };
-            inner.read_cache.insert(fh_val, cache);
+            slot.insert(cache);
         }
 
         // Figure out which byte ranges still need to be fetched from MTP.

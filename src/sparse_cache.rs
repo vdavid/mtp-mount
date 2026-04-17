@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn read_at_past_end_returns_empty() {
-        let cache = SparseCache::new(100).unwrap();
+        let mut cache = SparseCache::new(100).unwrap();
         let read = cache.read_at(200, 50).unwrap();
         assert_eq!(read, Vec::<u8>::new());
     }

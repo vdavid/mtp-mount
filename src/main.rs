@@ -2,6 +2,7 @@ mod buffer;
 mod error;
 mod fs;
 mod inode;
+mod sparse_cache;
 
 use clap::Parser;
 
