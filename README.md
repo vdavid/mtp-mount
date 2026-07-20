@@ -52,7 +52,29 @@ umount /mnt/phone            # Linux
 diskutil unmount /mnt/phone  # macOS
 ```
 
+Give a worn-out cable more (or less) room to recover:
+
+```sh
+mtp-mount --reconnect-timeout 60 /mnt/phone  # wait a minute for the device to come back
+mtp-mount --reconnect-timeout 0 /mnt/phone   # don't wait at all, unmount on the first drop
+```
+
 Run `mtp-mount --help` for the full list of flags, examples, and troubleshooting tips.
+
+## When the cable glitches
+
+Old and worn USB cables drop the device for a second and bring it back. `mtp-mount` rides that out:
+
+- The mount stays up, and the device is reopened by serial number, so a replug can't land you on a different phone.
+- Filesystem calls made while the device is away **wait** for it instead of failing, and they resume once it's back.
+  Files you have open keep working, bytes already read stay cached, and a file you were writing still uploads.
+- The wait is capped by `--reconnect-timeout` (30 seconds by default), so nothing hangs forever. Set it to `0` to fail
+  fast instead.
+- If the device doesn't come back in time, `mtp-mount` prints why and unmounts, rather than leaving a mount point that
+  answers every command with an I/O error.
+
+MTP identifies files by session-scoped handles, so all of them go stale the moment the device reconnects. `mtp-mount`
+looks each one up again by path, keeping inode numbers unchanged, which is what lets already-open files carry on.
 
 ## What works
 
@@ -62,6 +84,7 @@ Run `mtp-mount --help` for the full list of flags, examples, and troubleshooting
 - **Delete**: `rm`
 - **Rename and move**: `mv`
 - **Large files**: files larger than 4 GB read end-to-end (no 32-bit truncation)
+- **Flaky cables**: the mount survives a device that drops off the bus and comes back
 
 ## What doesn't work (and why)
 
@@ -149,7 +172,7 @@ Integration tests mount a virtual MTP device via FUSE (Linux only, needs `libfus
 cargo test --test integration -- --ignored --test-threads=1
 ```
 
-77 tests total (56 unit + 21 integration), all passing on Linux. The integration tests use `mtp-rs`'s virtual device
+99 tests total (72 unit + 27 integration), all passing on Linux. The integration tests use `mtp-rs`'s virtual device
 transport, so CI runs without any physical hardware.
 
 ## License

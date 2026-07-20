@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A cable glitch no longer kills the mount.** When the device disconnects, `mtp-mount` keeps the mount alive and reopens the same device (matched on serial number) as soon as it's back, then carries on: open file descriptors keep reading, cached read data stays, and a write that was still spooling is uploaded once the device returns. Filesystem calls block while the reconnect is in flight instead of failing, and never longer than the window.
+- **`--reconnect-timeout <SECONDS>`** (default 30) sets how long to wait for a device that went away. `0` turns reconnection off: the first disconnect unmounts right away. When the window runs out, `mtp-mount` says so and unmounts, instead of leaving a mount that answers every call with `EIO`.
+
 ### Fixed
+
+- **Re-listing a directory no longer changes its files' inode numbers.** Inodes are now reused for entries that are still there under the same name, so an `ls` in one terminal can't break a file another process has open.
+
+### Changed
+
+- Uploading on `close()` now reports failures: `close()` returns `EIO` when the flush didn't reach the device, instead of silently succeeding while only the log knew.
 
 - **Big writes no longer risk an out-of-memory stop.** Write buffers and read caches spooled to `$TMPDIR`, which is a tmpfs (RAM) on most current Linux distros, so `cp bigvideo.mp4 /mnt/phone/` tried to hold the whole file in memory. They now spool to a disk-backed per-user directory: `$XDG_CACHE_HOME/mtp-mount/spool` (falling back to `~/.cache/mtp-mount/spool`) on Linux, `~/Library/Caches/mtp-mount/spool` on macOS. The files stay unlinked, so their space comes back on its own after a crash.
 

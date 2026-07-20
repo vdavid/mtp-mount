@@ -1,17 +1,24 @@
 mod buffer;
+mod device;
 mod error;
 mod fs;
 mod hints;
 mod inode;
+mod reconnect;
+mod shutdown;
 mod sparse_cache;
 mod spool;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 
-use crate::fs::MtpFs;
+use crate::device::{UnplugSwitch, UsbOpener};
+use crate::fs::{MtpFs, MtpFsConfig};
 use crate::hints::{indent, open_failure_hint, BUSY_HINT, PERMISSION_HINT};
+use crate::reconnect::ReconnectPolicy;
 
 /// Mount MTP devices as local filesystems via FUSE.
 ///
@@ -46,6 +53,10 @@ struct Cli {
     /// Directory for spooling writes and read caches (defaults to your cache dir)
     #[arg(long, value_name = "PATH")]
     spool_dir: Option<PathBuf>,
+
+    /// Seconds to wait for a disconnected device to come back (0 unmounts right away)
+    #[arg(long, value_name = "SECONDS", default_value_t = ReconnectPolicy::DEFAULT_TIMEOUT_SECS)]
+    reconnect_timeout: u64,
 }
 
 /// The hand-written `--help` sections.
@@ -71,6 +82,9 @@ EXAMPLES:
     Unmount:
         umount /mnt/phone
 
+    Give a worn-out cable a minute to recover (0 unmounts on the first drop):
+        mtp-mount --reconnect-timeout 60 /mnt/phone
+
     Show debug output (handy for troubleshooting):
         RUST_LOG=debug mtp-mount /mnt/phone
 
@@ -89,7 +103,12 @@ NOTES:
     Files are uploaded to the device when you close them, not on each write.
     While a file is open for writing it's spooled to disk under your cache
     directory (--spool-dir overrides it), so uploads bigger than RAM work.
-    MTP doesn't support partial writes, hardlinks, symlinks, or chmod.",
+    MTP doesn't support partial writes, hardlinks, symlinks, or chmod.
+
+    If the device disconnects, the mount waits for it to come back (up to
+    --reconnect-timeout, 30 seconds by default) and picks up where it left
+    off, including files you have open. Commands wait during that window
+    instead of failing. If the device stays away, the mount is taken down.",
         busy = indent(BUSY_HINT, "        "),
         permission = indent(PERMISSION_HINT, "        "),
     )
@@ -180,16 +199,73 @@ fn main() {
         }
     };
 
-    let mtp_fs = MtpFs::new(device, cli.read_only, handle, spool_dir);
+    // Reconnect targets the serial of the device we actually opened, so a
+    // replug can't silently land us on a different phone.
+    let serial = match device.device_info().serial_number.trim() {
+        "" => {
+            eprintln!(
+                "Note: this device reports no serial number, so a reconnect \
+                 opens whichever MTP device is available."
+            );
+            None
+        }
+        serial => Some(serial.to_string()),
+    };
+    let unplug = UnplugSwitch::default();
+    let opener = Arc::new(UsbOpener::new(serial, unplug.clone()));
+
+    let mtp_fs = MtpFs::new(
+        device,
+        opener,
+        handle,
+        MtpFsConfig {
+            read_only: cli.read_only,
+            spool_dir,
+            reconnect: ReconnectPolicy::from_secs(cli.reconnect_timeout),
+            unplug,
+        },
+    );
+    let shutdown = mtp_fs.shutdown();
     let mount_options = mtp_fs.mount_options();
 
     let mut config = fuser::Config::default();
     config.mount_options = mount_options;
 
+    // The session runs on its own thread rather than through `fuser::mount2`,
+    // so this thread can unmount when the filesystem gives up on a device that
+    // never came back.
+    let session = match fuser::spawn_mount2(mtp_fs, mountpoint, &config) {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("Mount failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
     println!("Mounted. Press Ctrl+C to unmount.");
 
-    if let Err(e) = fuser::mount2(mtp_fs, mountpoint, &config) {
-        eprintln!("Mount failed: {e}");
+    // Either the filesystem gives up on the device, or the mount ends the
+    // normal way (`umount`, or the kernel tearing the session down).
+    let gave_up = loop {
+        if shutdown.wait_timeout(Duration::from_millis(250)).is_some() {
+            break true;
+        }
+        if session.guard.is_finished() {
+            break false;
+        }
+    };
+
+    let ended = if gave_up {
+        session.umount_and_join()
+    } else {
+        session.join()
+    };
+
+    if let Err(e) = ended {
+        eprintln!("Mount ended with an error: {e}");
+        std::process::exit(1);
+    }
+    if gave_up {
         std::process::exit(1);
     }
 }

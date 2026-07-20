@@ -1,7 +1,10 @@
 pub mod buffer;
+pub mod device;
 pub mod error;
 pub mod fs;
 pub mod hints;
 pub mod inode;
+pub mod reconnect;
+pub mod shutdown;
 pub mod sparse_cache;
 pub mod spool;

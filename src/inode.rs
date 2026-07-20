@@ -25,6 +25,10 @@ pub struct InodeEntry {
     pub size: u64,
     pub mtime: SystemTime,
     pub atime: SystemTime,
+    /// Link generation the handle in `kind` was resolved against. MTP handles
+    /// are session-scoped, so a handle from an older generation is a stale
+    /// token that has to be re-resolved by path before it's used again.
+    pub generation: u64,
 }
 
 impl InodeEntry {
@@ -45,6 +49,18 @@ pub struct InodeTable {
     /// parent_inode -> list of child inodes
     children_index: HashMap<u64, Vec<u64>>,
     next_inode: u64,
+    /// Bumped on every reconnect; see [`InodeEntry::generation`].
+    generation: u64,
+}
+
+/// One child as the device reports it, for [`InodeTable::sync_children`].
+#[derive(Debug, Clone)]
+pub struct ChildInfo {
+    pub handle: ObjectHandle,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: SystemTime,
 }
 
 impl Default for InodeTable {
@@ -64,6 +80,7 @@ impl InodeTable {
             size: 0,
             mtime: SystemTime::UNIX_EPOCH,
             atime: SystemTime::UNIX_EPOCH,
+            generation: 0,
         };
         let mut entries = HashMap::new();
         entries.insert(FUSE_ROOT_INODE, root);
@@ -73,6 +90,53 @@ impl InodeTable {
             name_index: HashMap::new(),
             children_index: HashMap::new(),
             next_inode: 2,
+            generation: 0,
+        }
+    }
+
+    /// Marks every cached object handle as stale, without touching inode
+    /// numbers, names, or the tree shape. Called after a reconnect: the kernel
+    /// and any open file descriptor keep referring to the same inodes, while
+    /// the handles behind them get re-resolved by path on next use.
+    pub fn bump_generation(&mut self) {
+        self.generation += 1;
+    }
+
+    /// Whether this inode's handle was resolved against the current session.
+    /// Storage and root entries carry no session-scoped handle, so they're
+    /// always fresh (their storage IDs are re-mapped eagerly on reconnect).
+    pub fn is_fresh(&self, inode: u64) -> bool {
+        match self.entries.get(&inode) {
+            Some(entry) => match entry.kind {
+                InodeKind::Root | InodeKind::Storage { .. } => true,
+                InodeKind::Directory { .. } | InodeKind::File { .. } => {
+                    entry.generation == self.generation
+                }
+            },
+            None => false,
+        }
+    }
+
+    /// Points an inode at a freshly resolved handle, keeping its inode number.
+    pub fn set_handle(&mut self, inode: u64, handle: ObjectHandle) {
+        let generation = self.generation;
+        let Some(entry) = self.entries.get_mut(&inode) else {
+            return;
+        };
+        entry.kind = match entry.kind {
+            InodeKind::Directory { .. } => InodeKind::Directory { handle },
+            InodeKind::File { .. } => InodeKind::File { handle },
+            _ => return,
+        };
+        entry.generation = generation;
+    }
+
+    /// Re-points a storage inode at a storage ID from the current session.
+    pub fn set_storage_id(&mut self, inode: u64, storage_id: StorageId) {
+        if let Some(entry) = self.entries.get_mut(&inode) {
+            if matches!(entry.kind, InodeKind::Storage { .. }) {
+                entry.kind = InodeKind::Storage { storage_id };
+            }
         }
     }
 
@@ -105,6 +169,7 @@ impl InodeTable {
             size: 0,
             mtime: now,
             atime: now,
+            generation: self.generation,
         })
     }
 
@@ -132,7 +197,82 @@ impl InodeTable {
             size,
             mtime,
             atime: mtime,
+            generation: self.generation,
         })
+    }
+
+    /// Replaces a directory's children with what the device just reported,
+    /// **reusing the inode number** of every child that's still there under the
+    /// same name and kind.
+    ///
+    /// Inode numbers must survive a re-listing: the kernel caches them and open
+    /// file descriptors refer to them, so handing out a fresh number for a file
+    /// that didn't go anywhere breaks reads on an already-open fd. Only the
+    /// handle, size, and mtime are refreshed in place. Children the device no
+    /// longer reports are removed.
+    pub fn sync_children(&mut self, parent_inode: u64, children: &[ChildInfo]) {
+        let generation = self.generation;
+
+        for child in children {
+            match self.lookup(parent_inode, &child.name) {
+                Some(ino)
+                    if self
+                        .entries
+                        .get(&ino)
+                        .is_some_and(|e| e.is_dir() == child.is_dir) =>
+                {
+                    let entry = self.entries.get_mut(&ino).expect("looked up above");
+                    entry.kind = if child.is_dir {
+                        InodeKind::Directory {
+                            handle: child.handle,
+                        }
+                    } else {
+                        InodeKind::File {
+                            handle: child.handle,
+                        }
+                    };
+                    entry.size = child.size;
+                    entry.mtime = child.mtime;
+                    entry.generation = generation;
+                }
+                // A name that flipped between file and directory is a different
+                // object; drop the old inode and allocate a new one.
+                Some(ino) => {
+                    self.remove(ino);
+                    self.add_object(
+                        parent_inode,
+                        child.handle,
+                        child.name.clone(),
+                        child.is_dir,
+                        child.size,
+                        child.mtime,
+                    );
+                }
+                None => {
+                    self.add_object(
+                        parent_inode,
+                        child.handle,
+                        child.name.clone(),
+                        child.is_dir,
+                        child.size,
+                        child.mtime,
+                    );
+                }
+            }
+        }
+
+        let gone: Vec<u64> = self
+            .children(parent_inode)
+            .into_iter()
+            .filter(|ino| {
+                self.entries
+                    .get(ino)
+                    .is_some_and(|e| !children.iter().any(|c| c.name == e.name))
+            })
+            .collect();
+        for ino in gone {
+            self.remove(ino);
+        }
     }
 
     /// Looks up an entry by inode number.
@@ -207,21 +347,6 @@ impl InodeTable {
             }
             _ => None,
         })
-    }
-
-    /// Removes all children of the given parent (for cache invalidation).
-    pub fn clear_children(&mut self, parent_inode: u64) {
-        let child_inodes = self
-            .children_index
-            .remove(&parent_inode)
-            .unwrap_or_default();
-        for child_ino in child_inodes {
-            if let Some(entry) = self.entries.remove(&child_ino) {
-                self.name_index.remove(&(parent_inode, entry.name));
-            }
-            // Recursively clear grandchildren index entries (but not deeply).
-            self.children_index.remove(&child_ino);
-        }
     }
 }
 
@@ -396,37 +521,132 @@ mod tests {
         assert!(table.children(dir_ino).contains(&file_ino));
     }
 
+    fn child(handle: u64, name: &str, is_dir: bool, size: u64) -> ChildInfo {
+        ChildInfo {
+            handle: ObjectHandle(handle),
+            name: name.into(),
+            is_dir,
+            size,
+            mtime: SystemTime::UNIX_EPOCH,
+        }
+    }
+
     #[test]
-    fn test_clear_children() {
+    fn test_sync_children_keeps_inode_numbers_stable() {
         let mut table = InodeTable::new();
         let storage_ino = table.add_storage(StorageId(1), "Internal".into());
-        let mtime = SystemTime::UNIX_EPOCH;
-        let f1 = table.add_object(
+        table.sync_children(
             storage_ino,
-            ObjectHandle(10),
-            "a.txt".into(),
-            false,
-            100,
-            mtime,
+            &[
+                child(10, "a.txt", false, 100),
+                child(11, "b.txt", false, 200),
+            ],
         );
-        let f2 = table.add_object(
+        let a = table.lookup(storage_ino, "a.txt").unwrap();
+
+        // Re-listing the same directory with new handles (a fresh session) must
+        // keep the inode number: open fds and the kernel cache depend on it.
+        table.sync_children(
             storage_ino,
-            ObjectHandle(11),
-            "b.txt".into(),
-            false,
-            200,
-            mtime,
+            &[
+                child(77, "a.txt", false, 150),
+                child(78, "b.txt", false, 200),
+            ],
         );
 
-        table.clear_children(storage_ino);
+        assert_eq!(table.lookup(storage_ino, "a.txt"), Some(a));
+        let entry = table.get(a).unwrap();
+        assert_eq!(
+            entry.kind,
+            InodeKind::File {
+                handle: ObjectHandle(77)
+            }
+        );
+        assert_eq!(entry.size, 150);
+    }
 
-        assert!(table.children(storage_ino).is_empty());
-        assert!(table.get(f1).is_none());
-        assert!(table.get(f2).is_none());
-        assert_eq!(table.lookup(storage_ino, "a.txt"), None);
-        assert_eq!(table.lookup(storage_ino, "b.txt"), None);
-        // The storage itself should still exist.
-        assert!(table.get(storage_ino).is_some());
+    #[test]
+    fn test_sync_children_adds_and_removes() {
+        let mut table = InodeTable::new();
+        let storage_ino = table.add_storage(StorageId(1), "Internal".into());
+        table.sync_children(
+            storage_ino,
+            &[
+                child(10, "stays.txt", false, 1),
+                child(11, "goes.txt", false, 2),
+            ],
+        );
+        let goes = table.lookup(storage_ino, "goes.txt").unwrap();
+
+        table.sync_children(
+            storage_ino,
+            &[
+                child(10, "stays.txt", false, 1),
+                child(12, "new.txt", false, 3),
+            ],
+        );
+
+        assert!(table.get(goes).is_none());
+        assert_eq!(table.lookup(storage_ino, "goes.txt"), None);
+        assert!(table.lookup(storage_ino, "new.txt").is_some());
+        assert_eq!(table.children(storage_ino).len(), 2);
+    }
+
+    #[test]
+    fn test_sync_children_replaces_when_kind_flips() {
+        let mut table = InodeTable::new();
+        let storage_ino = table.add_storage(StorageId(1), "Internal".into());
+        table.sync_children(storage_ino, &[child(10, "thing", false, 5)]);
+        let file_ino = table.lookup(storage_ino, "thing").unwrap();
+
+        table.sync_children(storage_ino, &[child(11, "thing", true, 0)]);
+
+        let dir_ino = table.lookup(storage_ino, "thing").unwrap();
+        assert_ne!(
+            dir_ino, file_ino,
+            "a file replaced by a dir is a new object"
+        );
+        assert!(table.get(dir_ino).unwrap().is_dir());
+    }
+
+    #[test]
+    fn test_generation_marks_handles_stale() {
+        let mut table = InodeTable::new();
+        let storage_ino = table.add_storage(StorageId(1), "Internal".into());
+        table.sync_children(storage_ino, &[child(10, "a.txt", false, 100)]);
+        let a = table.lookup(storage_ino, "a.txt").unwrap();
+        assert!(table.is_fresh(a));
+
+        table.bump_generation();
+
+        assert!(!table.is_fresh(a), "handles from an old session are stale");
+        assert!(
+            table.is_fresh(storage_ino),
+            "storage inodes carry no session-scoped handle"
+        );
+        assert!(table.is_fresh(FUSE_ROOT_INODE));
+
+        table.set_handle(a, ObjectHandle(999));
+        assert!(table.is_fresh(a));
+        assert_eq!(
+            table.get(a).unwrap().kind,
+            InodeKind::File {
+                handle: ObjectHandle(999)
+            }
+        );
+    }
+
+    #[test]
+    fn test_set_storage_id_remaps_in_place() {
+        let mut table = InodeTable::new();
+        let storage_ino = table.add_storage(StorageId(1), "Internal".into());
+        table.set_storage_id(storage_ino, StorageId(42));
+        assert_eq!(
+            table.get(storage_ino).unwrap().kind,
+            InodeKind::Storage {
+                storage_id: StorageId(42)
+            }
+        );
     }
 
     #[test]

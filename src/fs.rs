@@ -14,15 +14,38 @@ use fuser::{
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
     TimeOrNow, WriteFlags,
 };
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use mtp_rs::mtp::{DeviceEvent, MtpDevice};
 use mtp_rs::{NewObjectInfo, ObjectHandle, Storage};
 
 use crate::buffer::WriteBuffer;
-use crate::inode::{InodeEntry, InodeKind, InodeTable, FUSE_ROOT_INODE};
+use crate::device::{is_link_lost, DeviceOpener, UnplugSwitch};
+use crate::inode::{ChildInfo, InodeEntry, InodeKind, InodeTable, FUSE_ROOT_INODE};
+use crate::reconnect::ReconnectPolicy;
+use crate::shutdown::Shutdown;
 use crate::sparse_cache::SparseCache;
 
 const TTL: Duration = Duration::from_secs(1);
+
+/// How many times an operation is retried across reconnects before it gives up.
+/// One reconnect is the cable glitch we're here for; a second is a device that
+/// keeps dropping mid-operation, and past that the retry is not the answer.
+const MAX_ATTEMPTS: u32 = 3;
+
+type MtpResult<T> = Result<T, mtp_rs::Error>;
+
+/// Everything the mount needs beyond the device itself.
+pub struct MtpFsConfig {
+    pub read_only: bool,
+    /// Disk-backed directory for write buffers and read caches (see [`crate::spool`]).
+    /// Must exist and be writable; resolve it with [`crate::spool::spool_dir_from_env`]
+    /// and [`crate::spool::prepare_spool_dir`].
+    pub spool_dir: PathBuf,
+    /// How long to wait for a device that went away.
+    pub reconnect: ReconnectPolicy,
+    /// The pretend cable, shared with the [`DeviceOpener`] (tests only).
+    pub unplug: UnplugSwitch,
+}
 
 fn mtp_datetime_to_system_time(dt: &mtp_rs::DateTime) -> SystemTime {
     fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -67,6 +90,28 @@ fn inode_to_file_attr(entry: &InodeEntry) -> FileAttr {
         rdev: 0,
         blksize: 4096,
         flags: 0,
+    }
+}
+
+/// The name a storage shows up under in the mount.
+fn storage_name(storage: &Storage) -> String {
+    if storage.info().description.is_empty() {
+        format!("Storage_{}", storage.id().0)
+    } else {
+        storage.info().description.clone()
+    }
+}
+
+/// The temporary name a safe flush uploads under before renaming into place.
+fn temp_upload_name(name: &str) -> String {
+    format!(".~tmp~{name}")
+}
+
+/// Wraps a local I/O failure as an MTP error so spool problems flow through the
+/// same result type as device problems.
+fn io_error(e: io::Error) -> mtp_rs::Error {
+    mtp_rs::Error::Io {
+        message: e.to_string(),
     }
 }
 
@@ -121,8 +166,16 @@ struct Inner {
 pub struct MtpFs {
     rt: tokio::runtime::Handle,
     device: Mutex<MtpDevice>,
-    /// Clone of the device for event polling (avoids holding the device lock).
-    event_device: MtpDevice,
+    /// How to reopen the same device after it goes away.
+    opener: Arc<dyn DeviceOpener>,
+    policy: ReconnectPolicy,
+    unplug: UnplugSwitch,
+    /// Raised when the device is gone for good, so whoever owns the mount takes
+    /// it down instead of leaving something that answers every call with EIO.
+    shutdown: Arc<Shutdown>,
+    /// Bumped on every reconnect so the event loop from the previous session
+    /// notices it's been superseded and exits.
+    event_epoch: Arc<AtomicU64>,
     inner: Arc<Mutex<Inner>>,
     next_fh: AtomicU64,
     read_only: bool,
@@ -132,19 +185,30 @@ pub struct MtpFs {
 }
 
 impl MtpFs {
-    /// `spool_dir` must exist and be writable; resolve it with
-    /// [`crate::spool::spool_dir_from_env`] and [`crate::spool::prepare_spool_dir`].
+    /// Builds a filesystem over an already-open device.
+    ///
+    /// `opener` must resolve to that same device; it's what the mount uses to
+    /// come back after a disconnect.
     pub fn new(
         device: MtpDevice,
-        read_only: bool,
+        opener: Arc<dyn DeviceOpener>,
         rt: tokio::runtime::Handle,
-        spool_dir: PathBuf,
+        config: MtpFsConfig,
     ) -> Self {
-        let event_device = device.clone();
+        let MtpFsConfig {
+            read_only,
+            spool_dir,
+            reconnect,
+            unplug,
+        } = config;
         Self {
             rt,
             device: Mutex::new(device),
-            event_device,
+            opener,
+            policy: reconnect,
+            unplug,
+            shutdown: Arc::new(Shutdown::default()),
+            event_epoch: Arc::new(AtomicU64::new(0)),
             inner: Arc::new(Mutex::new(Inner {
                 storages: Vec::new(),
                 spool_dir: spool_dir.clone(),
@@ -158,6 +222,14 @@ impl MtpFs {
             read_only,
             fetch_counter: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The signal that asks for this mount to be taken down.
+    ///
+    /// Whoever mounted the filesystem owns the unmount handle, so it has to
+    /// watch this and unmount when a reason shows up. See [`crate::shutdown`].
+    pub fn shutdown(&self) -> Arc<Shutdown> {
+        Arc::clone(&self.shutdown)
     }
 
     /// Returns a shared handle to the MTP fetch counter.
@@ -191,13 +263,204 @@ impl MtpFs {
         }
     }
 
-    /// Get the MTP parent handle for a given directory inode.
-    fn mtp_parent_handle(inner: &Inner, inode: u64) -> Option<Option<ObjectHandle>> {
-        let entry = inner.inodes.get(inode)?;
-        match &entry.kind {
-            InodeKind::Storage { .. } => Some(None),
-            InodeKind::Directory { handle } => Some(Some(*handle)),
-            _ => None,
+    /// Runs an MTP operation, riding out a disconnect if one happens.
+    ///
+    /// `attempt` is re-run from scratch after a successful reconnect, so it must
+    /// resolve its own handles (through [`Self::file_handle`] and friends) rather
+    /// than close over handles from the dead session.
+    fn with_reconnect<T>(
+        &self,
+        inner: &mut Inner,
+        mut attempt: impl FnMut(&Self, &mut Inner) -> MtpResult<T>,
+    ) -> MtpResult<T> {
+        for _ in 0..MAX_ATTEMPTS {
+            if !self.unplug.is_unplugged() {
+                match attempt(self, inner) {
+                    Ok(value) => return Ok(value),
+                    Err(e) if !is_link_lost(&e) => return Err(e),
+                    Err(e) => debug!("Operation hit a dead session: {e}"),
+                }
+            }
+            self.reconnect(inner)?;
+        }
+        Err(mtp_rs::Error::Disconnected)
+    }
+
+    /// Waits for the device to come back and rebuilds the session on top of the
+    /// existing inode tree. Gives up (and unmounts) when the window runs out.
+    fn reconnect(&self, inner: &mut Inner) -> MtpResult<()> {
+        let who = self.opener.describe();
+
+        if self.policy.is_disabled() {
+            self.give_up(&format!(
+                "{who} disconnected and reconnect is off (--reconnect-timeout 0)"
+            ));
+            return Err(mtp_rs::Error::Disconnected);
+        }
+
+        let secs = self.policy.timeout().as_secs();
+        info!("{who} disconnected, waiting up to {secs}s for it to come back...");
+        eprintln!("mtp-mount: {who} disconnected, waiting up to {secs}s for it to come back...");
+
+        for delay in self.policy.schedule() {
+            std::thread::sleep(delay);
+            if self.unplug.is_unplugged() {
+                continue;
+            }
+            let device = match self.opener.open(&self.rt) {
+                Ok(device) => device,
+                Err(e) => {
+                    debug!("Reconnect attempt failed: {e}");
+                    continue;
+                }
+            };
+            match self.adopt(inner, device) {
+                Ok(()) => {
+                    eprintln!("mtp-mount: {who} is back, carrying on.");
+                    return Ok(());
+                }
+                Err(e) => {
+                    warn!("Reopened {who} but couldn't resume the mount: {e}");
+                    continue;
+                }
+            }
+        }
+
+        self.give_up(&format!("{who} didn't come back within {secs}s"));
+        Err(mtp_rs::Error::Disconnected)
+    }
+
+    /// Takes over a freshly opened device: re-maps storage IDs, marks every
+    /// cached object handle stale, and starts a new event loop.
+    ///
+    /// Inode numbers, names, the tree shape, open file handles, read caches, and
+    /// write spools all survive untouched. Only the session-scoped tokens change.
+    fn adopt(&self, inner: &mut Inner, device: MtpDevice) -> MtpResult<()> {
+        let storages = self.rt.block_on(device.storages())?;
+
+        // Storage IDs are session-scoped too. Match the new storages to the
+        // storage inodes by name, falling back to position when a device
+        // reports no description (the old name embeds the old ID).
+        let storage_inodes = inner.inodes.children(FUSE_ROOT_INODE);
+        for (position, storage_ino) in storage_inodes.iter().enumerate() {
+            let name = match inner.inodes.get(*storage_ino) {
+                Some(entry) => entry.name.clone(),
+                None => continue,
+            };
+            let matched = storages
+                .iter()
+                .find(|s| storage_name(s) == name)
+                .or_else(|| storages.get(position));
+            match matched {
+                Some(storage) => inner.inodes.set_storage_id(*storage_ino, storage.id()),
+                None => warn!("Storage '{name}' is missing after the reconnect"),
+            }
+        }
+
+        inner.storages = storages;
+        *self.device.lock().unwrap() = device.clone();
+        inner.inodes.bump_generation();
+
+        // Names and sizes are re-read on the next access; the handles behind
+        // them are re-resolved lazily by path.
+        inner.dirs_loaded.clear();
+        inner.dirs_loaded.insert(FUSE_ROOT_INODE, true);
+
+        let epoch = self.event_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.spawn_event_loop(device, epoch);
+        Ok(())
+    }
+
+    /// Says why the mount is going away and asks for it to be taken down. The
+    /// operation that triggered this still returns an error to its caller.
+    fn give_up(&self, reason: &str) {
+        error!("{reason}; unmounting");
+        eprintln!("mtp-mount: {reason}. Unmounting.");
+        self.shutdown.request(reason);
+    }
+
+    /// Re-resolves an inode's MTP handle by path if it came from an older
+    /// session, walking down from the storage root and refreshing each ancestor
+    /// on the way. Inode numbers never change here.
+    fn ensure_fresh(&self, inner: &mut Inner, inode: u64) -> MtpResult<()> {
+        if inner.inodes.is_fresh(inode) {
+            return Ok(());
+        }
+
+        // Collect the chain from the storage root down to this inode.
+        let mut chain = Vec::new();
+        let mut current = inode;
+        loop {
+            let entry = inner.inodes.get(current).ok_or(mtp_rs::Error::NotFound)?;
+            match entry.kind {
+                InodeKind::Root | InodeKind::Storage { .. } => break,
+                _ => {
+                    chain.push(current);
+                    if current == entry.parent {
+                        return Err(mtp_rs::Error::NotFound);
+                    }
+                    current = entry.parent;
+                }
+            }
+        }
+        chain.reverse();
+
+        let storage_idx = Self::find_storage_index(inner, inode).ok_or(mtp_rs::Error::NotFound)?;
+
+        let mut parent_handle: Option<ObjectHandle> = None;
+        for node in chain {
+            let entry = inner.inodes.get(node).ok_or(mtp_rs::Error::NotFound)?;
+            let name = entry.name.clone();
+            if inner.inodes.is_fresh(node) {
+                parent_handle = match inner.inodes.get(node).map(|e| &e.kind) {
+                    Some(InodeKind::Directory { handle } | InodeKind::File { handle }) => {
+                        Some(*handle)
+                    }
+                    _ => return Err(mtp_rs::Error::NotFound),
+                };
+                continue;
+            }
+
+            let objects = self
+                .rt
+                .block_on(inner.storages[storage_idx].list_objects(parent_handle))?;
+            let found = objects
+                .into_iter()
+                .find(|obj| obj.filename == name)
+                .ok_or(mtp_rs::Error::NotFound)?;
+            inner.inodes.set_handle(node, found.handle);
+            parent_handle = Some(found.handle);
+        }
+
+        Ok(())
+    }
+
+    /// The current handle of a file inode.
+    fn file_handle(&self, inner: &mut Inner, inode: u64) -> MtpResult<ObjectHandle> {
+        self.ensure_fresh(inner, inode)?;
+        match inner.inodes.get(inode).map(|e| &e.kind) {
+            Some(InodeKind::File { handle }) => Ok(*handle),
+            _ => Err(mtp_rs::Error::NotFound),
+        }
+    }
+
+    /// The current handle of a file or directory inode.
+    fn object_handle(&self, inner: &mut Inner, inode: u64) -> MtpResult<ObjectHandle> {
+        self.ensure_fresh(inner, inode)?;
+        match inner.inodes.get(inode).map(|e| &e.kind) {
+            Some(InodeKind::File { handle } | InodeKind::Directory { handle }) => Ok(*handle),
+            _ => Err(mtp_rs::Error::NotFound),
+        }
+    }
+
+    /// The MTP parent handle to use for operations inside a directory inode
+    /// (`None` means the storage root).
+    fn parent_handle(&self, inner: &mut Inner, inode: u64) -> MtpResult<Option<ObjectHandle>> {
+        self.ensure_fresh(inner, inode)?;
+        match inner.inodes.get(inode).map(|e| &e.kind) {
+            Some(InodeKind::Storage { .. }) => Ok(None),
+            Some(InodeKind::Directory { handle }) => Ok(Some(*handle)),
+            _ => Err(mtp_rs::Error::NotFound),
         }
     }
 
@@ -212,47 +475,41 @@ impl MtpFs {
             return;
         }
 
-        let mtp_parent = match Self::mtp_parent_handle(inner, parent_inode) {
-            Some(p) => p,
-            None => return,
-        };
-
-        let storage_idx = match Self::find_storage_index(inner, parent_inode) {
-            Some(i) => i,
-            None => return,
-        };
-
-        let objects = match self
-            .rt
-            .block_on(inner.storages[storage_idx].list_objects(mtp_parent))
-        {
-            Ok(objs) => objs,
-            Err(e) => {
-                error!("Failed to list MTP objects: {e}");
-                return;
+        match self.with_reconnect(inner, |fs, inner| fs.list_into_table(inner, parent_inode)) {
+            Ok(()) => {
+                inner.dirs_loaded.insert(parent_inode, true);
             }
-        };
-
-        inner.inodes.clear_children(parent_inode);
-
-        for obj in objects {
-            let mtime = obj
-                .modified
-                .as_ref()
-                .map(mtp_datetime_to_system_time)
-                .unwrap_or(UNIX_EPOCH);
-            let is_folder = obj.is_folder();
-            inner.inodes.add_object(
-                parent_inode,
-                obj.handle,
-                obj.filename,
-                is_folder,
-                obj.size,
-                mtime,
-            );
+            Err(e) => error!("Failed to list MTP objects: {e}"),
         }
+    }
 
-        inner.dirs_loaded.insert(parent_inode, true);
+    /// One listing pass: ask the device, then reconcile the inode table.
+    fn list_into_table(&self, inner: &mut Inner, parent_inode: u64) -> MtpResult<()> {
+        let mtp_parent = self.parent_handle(inner, parent_inode)?;
+        let storage_idx =
+            Self::find_storage_index(inner, parent_inode).ok_or(mtp_rs::Error::NotFound)?;
+
+        let objects = self
+            .rt
+            .block_on(inner.storages[storage_idx].list_objects(mtp_parent))?;
+
+        let children: Vec<ChildInfo> = objects
+            .into_iter()
+            .map(|obj| ChildInfo {
+                handle: obj.handle,
+                is_dir: obj.is_folder(),
+                size: obj.size,
+                mtime: obj
+                    .modified
+                    .as_ref()
+                    .map(mtp_datetime_to_system_time)
+                    .unwrap_or(UNIX_EPOCH),
+                name: obj.filename,
+            })
+            .collect();
+
+        inner.inodes.sync_children(parent_inode, &children);
+        Ok(())
     }
 
     /// Flush a dirty write buffer to MTP.
@@ -260,58 +517,77 @@ impl MtpFs {
     /// When the device supports rename, uses a safe upload-then-delete-then-rename
     /// sequence to avoid data loss if the upload fails. Falls back to
     /// delete-then-upload on devices without rename support.
-    fn flush_to_mtp(&self, inner: &mut Inner, fh: u64) {
+    ///
+    /// The spooled bytes live in an unlinked temp file that a disconnect can't
+    /// touch, so an upload interrupted by a cable glitch is retried from the
+    /// start once the device is back. Only the upload is retried: once it lands,
+    /// the data is on the device and a second attempt would just duplicate it.
+    fn flush_to_mtp(&self, inner: &mut Inner, fh: u64) -> MtpResult<()> {
         let buf = match inner.write_buf.close(fh) {
             Some(b) => b,
-            None => return,
+            None => return Ok(()),
         };
 
         if !buf.is_dirty() {
-            return;
+            return Ok(());
         }
 
         let inode = buf.inode;
         let mut file = buf.into_file();
-        if let Err(e) = file.seek(SeekFrom::Start(0)) {
-            error!("Flush: failed to rewind temp file: {e}");
-            return;
-        }
-        let file_len = file.seek(SeekFrom::End(0)).unwrap_or(0);
-        if let Err(e) = file.seek(SeekFrom::Start(0)) {
-            error!("Flush: failed to rewind temp file: {e}");
-            return;
-        }
+        let file_len = file.seek(SeekFrom::End(0)).map_err(io_error)?;
+
         let entry = match inner.inodes.get(inode) {
             Some(e) => e.clone(),
             None => {
                 error!("Flush: inode {inode} not found");
-                return;
+                return Err(mtp_rs::Error::NotFound);
             }
         };
 
-        let handle = match &entry.kind {
-            InodeKind::File { handle } => *handle,
-            _ => {
-                error!("Flush: inode {inode} is not a file");
-                return;
+        let mut attempts = 0u32;
+        self.with_reconnect(inner, |fs, inner| {
+            let mut attempt = file.try_clone().map_err(io_error)?;
+            attempt.seek(SeekFrom::Start(0)).map_err(io_error)?;
+            attempts += 1;
+            fs.flush_once(inner, inode, &entry, file_len, attempt, attempts > 1)
+        })
+    }
+
+    /// One flush attempt against the current session.
+    ///
+    /// `is_retry` means an earlier attempt died mid-upload, so a half-written
+    /// temp object may be sitting in the target directory; it's cleared out
+    /// before uploading again.
+    #[allow(clippy::too_many_arguments)]
+    fn flush_once(
+        &self,
+        inner: &mut Inner,
+        inode: u64,
+        entry: &InodeEntry,
+        size: u64,
+        file: std::fs::File,
+        is_retry: bool,
+    ) -> MtpResult<()> {
+        let handle = self.file_handle(inner, inode)?;
+        let storage_idx = Self::find_storage_index(inner, inode).ok_or(mtp_rs::Error::NotFound)?;
+        let parent_handle = match self.parent_handle(inner, entry.parent) {
+            Ok(handle) => handle,
+            Err(e) => {
+                error!("Flush: no parent directory for inode {inode}: {e}");
+                return Err(e);
             }
         };
-
-        let storage_idx = match Self::find_storage_index(inner, inode) {
-            Some(i) => i,
-            None => {
-                error!("Flush: no storage for inode {inode}");
-                return;
-            }
-        };
-
-        let parent_handle = inner.inodes.get(entry.parent).and_then(|p| match &p.kind {
-            InodeKind::Storage { .. } => None,
-            InodeKind::Directory { handle } => Some(*handle),
-            _ => None,
-        });
 
         let supports_rename = self.device.lock().unwrap().supports_rename();
+
+        if is_retry && supports_rename {
+            self.purge_leftover(
+                inner,
+                storage_idx,
+                parent_handle,
+                &temp_upload_name(&entry.name),
+            );
+        }
 
         if supports_rename {
             self.flush_safe(
@@ -320,10 +596,10 @@ impl MtpFs {
                 handle,
                 storage_idx,
                 parent_handle,
-                &entry,
-                file_len,
+                entry,
+                size,
                 file,
-            );
+            )
         } else {
             warn!(
                 "Flush: device does not support rename, using delete-then-upload \
@@ -335,14 +611,18 @@ impl MtpFs {
                 handle,
                 storage_idx,
                 parent_handle,
-                &entry,
-                file_len,
+                entry,
+                size,
                 file,
-            );
+            )
         }
     }
 
     /// Safe flush: upload with temp name, delete old, rename new.
+    ///
+    /// Only the upload returns an error to the caller: after it lands, the bytes
+    /// are safe on the device and a retry would upload them twice, so the later
+    /// steps report what happened and return `Ok`.
     #[allow(clippy::too_many_arguments)]
     fn flush_safe(
         &self,
@@ -354,9 +634,9 @@ impl MtpFs {
         entry: &InodeEntry,
         size: u64,
         file: std::fs::File,
-    ) {
+    ) -> MtpResult<()> {
         let storage = &inner.storages[storage_idx];
-        let temp_name = format!(".~tmp~{}", entry.name);
+        let temp_name = temp_upload_name(&entry.name);
 
         // Step 1: Upload new data with a temp name.
         let info = NewObjectInfo::file(&temp_name, size);
@@ -368,7 +648,7 @@ impl MtpFs {
             Ok(h) => h,
             Err(e) => {
                 error!("Flush: upload failed (original file untouched): {e}");
-                return;
+                return Err(e.into());
             }
         };
 
@@ -381,7 +661,7 @@ impl MtpFs {
                 e.size = size;
                 e.mtime = SystemTime::now();
             }
-            return;
+            return Ok(());
         }
 
         // Step 3: Rename temp to original name.
@@ -396,7 +676,7 @@ impl MtpFs {
                 e.size = size;
                 e.mtime = SystemTime::now();
             }
-            return;
+            return Ok(());
         }
 
         if let Some(e) = inner.inodes.get_mut(inode) {
@@ -404,6 +684,7 @@ impl MtpFs {
             e.size = size;
             e.mtime = SystemTime::now();
         }
+        Ok(())
     }
 
     /// Unsafe flush: delete old object, then upload. Data is lost if upload fails.
@@ -418,12 +699,12 @@ impl MtpFs {
         entry: &InodeEntry,
         size: u64,
         file: std::fs::File,
-    ) {
+    ) -> MtpResult<()> {
         let storage = &inner.storages[storage_idx];
 
         if let Err(e) = self.rt.block_on(storage.delete(old_handle)) {
             error!("Flush: failed to delete old object: {e}");
-            return;
+            return Err(e);
         }
 
         let info = NewObjectInfo::file(&entry.name, size);
@@ -439,9 +720,35 @@ impl MtpFs {
                     e.size = size;
                     e.mtime = SystemTime::now();
                 }
+                Ok(())
             }
             Err(e) => {
                 error!("Flush: upload failed after delete (data lost): {e}");
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Best-effort removal of a leftover object by name, used to clear a
+    /// half-uploaded temp file before retrying a flush.
+    fn purge_leftover(
+        &self,
+        inner: &mut Inner,
+        storage_idx: usize,
+        parent_handle: Option<ObjectHandle>,
+        name: &str,
+    ) {
+        let storage = &inner.storages[storage_idx];
+        let objects = match self.rt.block_on(storage.list_objects(parent_handle)) {
+            Ok(objects) => objects,
+            Err(e) => {
+                debug!("Flush retry: couldn't list the target directory: {e}");
+                return;
+            }
+        };
+        for obj in objects.into_iter().filter(|o| o.filename == name) {
+            if let Err(e) = self.rt.block_on(storage.delete(obj.handle)) {
+                warn!("Flush retry: couldn't remove leftover '{name}': {e}");
             }
         }
     }
@@ -462,19 +769,42 @@ impl MtpFs {
         opts
     }
 
+    /// Starts the event monitor for the current session.
+    fn spawn_event_loop(&self, device: MtpDevice, epoch: u64) {
+        let inner = Arc::clone(&self.inner);
+        let current_epoch = Arc::clone(&self.event_epoch);
+        self.rt.spawn(async move {
+            Self::event_loop(device, inner, current_epoch, epoch).await;
+        });
+    }
+
     /// Background event loop that polls the device for MTP events and invalidates
     /// cached directory listings when objects change on the device side.
-    async fn event_loop(device: MtpDevice, inner: Arc<Mutex<Inner>>) {
+    ///
+    /// Exits when its session is gone: either the device stopped answering, or a
+    /// reconnect moved the mount to a newer session (`epoch`), which starts its
+    /// own loop. A disconnect here doesn't tear the mount down; the next FUSE
+    /// operation is what drives the reconnect.
+    async fn event_loop(
+        device: MtpDevice,
+        inner: Arc<Mutex<Inner>>,
+        current_epoch: Arc<AtomicU64>,
+        epoch: u64,
+    ) {
         loop {
+            if current_epoch.load(Ordering::SeqCst) != epoch {
+                debug!("Event loop: superseded by a reconnect");
+                return;
+            }
             match tokio::time::timeout(Duration::from_millis(200), device.next_event()).await {
                 Ok(Ok(event)) => {
                     Self::handle_event(&inner, &event);
                 }
-                Ok(Err(mtp_rs::Error::Disconnected)) => {
+                Ok(Err(mtp_rs::Error::Timeout)) => continue,
+                Ok(Err(e)) if is_link_lost(&e) => {
                     debug!("Event loop: device disconnected");
                     break;
                 }
-                Ok(Err(mtp_rs::Error::Timeout)) => continue,
                 Ok(Err(e)) => {
                     warn!("Event loop error: {e}");
                     break;
@@ -559,13 +889,9 @@ impl Filesystem for MtpFs {
 
         let mut inner = self.inner.lock().unwrap();
         for storage in &storages {
-            let storage: &Storage = storage;
-            let name = if storage.info().description.is_empty() {
-                format!("Storage_{}", storage.id().0)
-            } else {
-                storage.info().description.clone()
-            };
-            inner.inodes.add_storage(storage.id(), name);
+            inner
+                .inodes
+                .add_storage(storage.id(), storage_name(storage));
         }
         inner.dirs_loaded.insert(FUSE_ROOT_INODE, true);
         inner.storages = storages;
@@ -573,11 +899,8 @@ impl Filesystem for MtpFs {
 
         // Spawn a background task that monitors device events and invalidates
         // cached directory listings when objects are added, removed, or changed.
-        let event_device = self.event_device.clone();
-        let event_inner = Arc::clone(&self.inner);
-        self.rt.spawn(async move {
-            Self::event_loop(event_device, event_inner).await;
-        });
+        let event_device = self.device.lock().unwrap().clone();
+        self.spawn_event_loop(event_device, self.event_epoch.load(Ordering::SeqCst));
 
         debug!(
             "MtpFs initialized with {} storages + event monitor",
@@ -734,21 +1057,10 @@ impl Filesystem for MtpFs {
             }
         };
 
-        let handle = match &entry.kind {
-            InodeKind::File { handle } => *handle,
-            _ => {
-                reply.error(Errno::EISDIR);
-                return;
-            }
-        };
-
-        let storage_idx = match Self::find_storage_index(&inner, ino.0) {
-            Some(i) => i,
-            None => {
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
+        if entry.is_dir() {
+            reply.error(Errno::EISDIR);
+            return;
+        }
 
         // Lazily create a sparse cache for this file handle.
         use std::collections::hash_map::Entry;
@@ -774,16 +1086,23 @@ impl Filesystem for MtpFs {
         // Fetch missing ranges. `read_range` uses the 64-bit partial-read op to
         // support offsets beyond 4 GB. Each USB transfer is capped at 1 MB to keep
         // latency reasonable.
+        // Each chunk resolves the object handle again inside `with_reconnect`,
+        // so a read that spans a cable glitch picks up the new session's handle
+        // and carries on from the byte it stopped at.
         const CHUNK: u64 = 1024 * 1024;
         for range in missing {
             let mut cursor = range.start;
             while cursor < range.end {
                 let chunk_size = (range.end - cursor).min(CHUNK) as u32;
                 self.fetch_counter.fetch_add(1, Ordering::Relaxed);
-                let bytes = match self
-                    .rt
-                    .block_on(inner.storages[storage_idx].read_range(handle, cursor, chunk_size))
-                {
+                let bytes = match self.with_reconnect(&mut inner, |fs, inner| {
+                    let handle = fs.file_handle(inner, ino.0)?;
+                    let storage_idx =
+                        Self::find_storage_index(inner, ino.0).ok_or(mtp_rs::Error::NotFound)?;
+                    fs.rt.block_on(
+                        inner.storages[storage_idx].read_range(handle, cursor, chunk_size),
+                    )
+                }) {
                     Ok(b) => b,
                     Err(e) => {
                         error!("MTP read_range failed at offset {cursor}: {e}");
@@ -831,13 +1150,24 @@ impl Filesystem for MtpFs {
         let fh_val = fh.0;
         let mut inner = self.inner.lock().unwrap();
 
-        if inner.write_buf.is_open(fh_val) {
-            self.flush_to_mtp(&mut inner, fh_val);
-        }
+        let flushed = if inner.write_buf.is_open(fh_val) {
+            self.flush_to_mtp(&mut inner, fh_val)
+        } else {
+            Ok(())
+        };
 
         inner.read_cache.remove(&fh_val);
         inner.fh_to_inode.remove(&fh_val);
-        reply.ok();
+
+        // A failed flush means the bytes never reached the device, so `close()`
+        // has to say so instead of pretending the write worked.
+        match flushed {
+            Ok(()) => reply.ok(),
+            Err(e) => {
+                error!("Flush on close failed: {e}");
+                reply.error(Errno::EIO);
+            }
+        }
     }
 
     fn write(
@@ -904,29 +1234,21 @@ impl Filesystem for MtpFs {
         let parent_ino = parent.0;
         let mut inner = self.inner.lock().unwrap();
 
-        let storage_idx = match Self::find_storage_index(&inner, parent_ino) {
-            Some(i) => i,
-            None => {
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
+        if !inner.inodes.get(parent_ino).is_some_and(|e| e.is_dir()) {
+            reply.error(Errno::ENOTDIR);
+            return;
+        }
 
-        let mtp_parent = match Self::mtp_parent_handle(&inner, parent_ino) {
-            Some(p) => p,
-            None => {
-                reply.error(Errno::ENOTDIR);
-                return;
-            }
-        };
-
-        let info = NewObjectInfo::file(name_str, 0);
-        let stream = bytes_stream(Vec::new());
-
-        let handle = match self
-            .rt
-            .block_on(inner.storages[storage_idx].upload(mtp_parent, info, stream))
-        {
+        let handle = match self.with_reconnect(&mut inner, |fs, inner| {
+            let mtp_parent = fs.parent_handle(inner, parent_ino)?;
+            let storage_idx =
+                Self::find_storage_index(inner, parent_ino).ok_or(mtp_rs::Error::NotFound)?;
+            let info = NewObjectInfo::file(name_str, 0);
+            let stream = bytes_stream(Vec::new());
+            fs.rt
+                .block_on(inner.storages[storage_idx].upload(mtp_parent, info, stream))
+                .map_err(mtp_rs::Error::from)
+        }) {
             Ok(h) => h,
             Err(e) => {
                 error!("MTP create failed: {e}");
@@ -984,26 +1306,18 @@ impl Filesystem for MtpFs {
         let parent_ino = parent.0;
         let mut inner = self.inner.lock().unwrap();
 
-        let storage_idx = match Self::find_storage_index(&inner, parent_ino) {
-            Some(i) => i,
-            None => {
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
+        if !inner.inodes.get(parent_ino).is_some_and(|e| e.is_dir()) {
+            reply.error(Errno::ENOTDIR);
+            return;
+        }
 
-        let mtp_parent = match Self::mtp_parent_handle(&inner, parent_ino) {
-            Some(p) => p,
-            None => {
-                reply.error(Errno::ENOTDIR);
-                return;
-            }
-        };
-
-        let handle = match self
-            .rt
-            .block_on(inner.storages[storage_idx].create_folder(mtp_parent, name_str))
-        {
+        let handle = match self.with_reconnect(&mut inner, |fs, inner| {
+            let mtp_parent = fs.parent_handle(inner, parent_ino)?;
+            let storage_idx =
+                Self::find_storage_index(inner, parent_ino).ok_or(mtp_rs::Error::NotFound)?;
+            fs.rt
+                .block_on(inner.storages[storage_idx].create_folder(mtp_parent, name_str))
+        }) {
             Ok(h) => h,
             Err(e) => {
                 error!("MTP mkdir failed: {e}");
@@ -1047,26 +1361,17 @@ impl Filesystem for MtpFs {
             }
         };
 
-        let handle = match inner.inodes.get(child_ino).and_then(|e| match &e.kind {
-            InodeKind::File { handle } => Some(*handle),
-            _ => None,
+        if inner.inodes.get(child_ino).is_some_and(|e| e.is_dir()) {
+            reply.error(Errno::EISDIR);
+            return;
+        }
+
+        if let Err(e) = self.with_reconnect(&mut inner, |fs, inner| {
+            let handle = fs.file_handle(inner, child_ino)?;
+            let storage_idx =
+                Self::find_storage_index(inner, child_ino).ok_or(mtp_rs::Error::NotFound)?;
+            fs.rt.block_on(inner.storages[storage_idx].delete(handle))
         }) {
-            Some(h) => h,
-            None => {
-                reply.error(Errno::EISDIR);
-                return;
-            }
-        };
-
-        let storage_idx = match Self::find_storage_index(&inner, child_ino) {
-            Some(i) => i,
-            None => {
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
-
-        if let Err(e) = self.rt.block_on(inner.storages[storage_idx].delete(handle)) {
             error!("MTP delete failed: {e}");
             reply.error(Errno::EIO);
             return;
@@ -1101,26 +1406,20 @@ impl Filesystem for MtpFs {
             }
         };
 
-        let handle = match inner.inodes.get(child_ino).and_then(|e| match &e.kind {
-            InodeKind::Directory { handle } => Some(*handle),
-            _ => None,
+        if !matches!(
+            inner.inodes.get(child_ino).map(|e| &e.kind),
+            Some(InodeKind::Directory { .. })
+        ) {
+            reply.error(Errno::ENOTDIR);
+            return;
+        }
+
+        if let Err(e) = self.with_reconnect(&mut inner, |fs, inner| {
+            let handle = fs.object_handle(inner, child_ino)?;
+            let storage_idx =
+                Self::find_storage_index(inner, child_ino).ok_or(mtp_rs::Error::NotFound)?;
+            fs.rt.block_on(inner.storages[storage_idx].delete(handle))
         }) {
-            Some(h) => h,
-            None => {
-                reply.error(Errno::ENOTDIR);
-                return;
-            }
-        };
-
-        let storage_idx = match Self::find_storage_index(&inner, child_ino) {
-            Some(i) => i,
-            None => {
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
-
-        if let Err(e) = self.rt.block_on(inner.storages[storage_idx].delete(handle)) {
             error!("MTP rmdir failed: {e}");
             reply.error(Errno::EIO);
             return;
@@ -1172,30 +1471,28 @@ impl Filesystem for MtpFs {
             }
         };
 
-        let handle = match inner.inodes.get(child_ino).and_then(|e| match &e.kind {
-            InodeKind::File { handle } | InodeKind::Directory { handle } => Some(*handle),
-            _ => None,
-        }) {
-            Some(h) => h,
-            None => {
-                reply.error(Errno::EINVAL);
-                return;
-            }
-        };
-
-        let storage_idx = match Self::find_storage_index(&inner, child_ino) {
-            Some(i) => i,
-            None => {
-                reply.error(Errno::EIO);
-                return;
-            }
-        };
+        if !matches!(
+            inner.inodes.get(child_ino).map(|e| &e.kind),
+            Some(InodeKind::File { .. } | InodeKind::Directory { .. })
+        ) {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        if parent_ino != newparent_ino
+            && !inner.inodes.get(newparent_ino).is_some_and(|e| e.is_dir())
+        {
+            reply.error(Errno::ENOTDIR);
+            return;
+        }
 
         if name_str != newname_str {
-            if let Err(e) = self
-                .rt
-                .block_on(inner.storages[storage_idx].rename(handle, newname_str))
-            {
+            if let Err(e) = self.with_reconnect(&mut inner, |fs, inner| {
+                let handle = fs.object_handle(inner, child_ino)?;
+                let storage_idx =
+                    Self::find_storage_index(inner, child_ino).ok_or(mtp_rs::Error::NotFound)?;
+                fs.rt
+                    .block_on(inner.storages[storage_idx].rename(handle, newname_str))
+            }) {
                 error!("MTP rename failed: {e}");
                 reply.error(Errno::EIO);
                 return;
@@ -1203,20 +1500,19 @@ impl Filesystem for MtpFs {
         }
 
         if parent_ino != newparent_ino {
-            let new_mtp_parent = match Self::mtp_parent_handle(&inner, newparent_ino) {
-                Some(Some(h)) => h,
-                Some(None) => ObjectHandle::ROOT,
-                None => {
-                    reply.error(Errno::ENOTDIR);
-                    return;
-                }
-            };
-
-            if let Err(e) = self.rt.block_on(inner.storages[storage_idx].move_object(
-                handle,
-                new_mtp_parent,
-                None,
-            )) {
+            if let Err(e) = self.with_reconnect(&mut inner, |fs, inner| {
+                let handle = fs.object_handle(inner, child_ino)?;
+                let storage_idx =
+                    Self::find_storage_index(inner, child_ino).ok_or(mtp_rs::Error::NotFound)?;
+                let new_mtp_parent = fs
+                    .parent_handle(inner, newparent_ino)?
+                    .unwrap_or(ObjectHandle::ROOT);
+                fs.rt.block_on(inner.storages[storage_idx].move_object(
+                    handle,
+                    new_mtp_parent,
+                    None,
+                ))
+            }) {
                 error!("MTP move failed: {e}");
                 reply.error(Errno::EIO);
                 return;
