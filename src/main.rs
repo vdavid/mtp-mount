@@ -54,7 +54,7 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     spool_dir: Option<PathBuf>,
 
-    /// Seconds to wait for a disconnected device to come back (0 unmounts right away)
+    /// Seconds to wait for a disconnected device to come back (default 0: unmount right away)
     #[arg(long, value_name = "SECONDS", default_value_t = ReconnectPolicy::DEFAULT_TIMEOUT_SECS)]
     reconnect_timeout: u64,
 }
@@ -105,10 +105,13 @@ NOTES:
     directory (--spool-dir overrides it), so uploads bigger than RAM work.
     MTP doesn't support partial writes, hardlinks, symlinks, or chmod.
 
-    If the device disconnects, the mount waits for it to come back (up to
-    --reconnect-timeout, 30 seconds by default) and picks up where it left
-    off, including files you have open. Commands wait during that window
-    instead of failing. If the device stays away, the mount is taken down.",
+    If the device disconnects, the mount is taken down. Pass
+    --reconnect-timeout SECONDS to wait for it to come back instead: the mount
+    then picks up where it left off, including files you have open. Useful with
+    a flaky cable that keeps dropping the link. It's off by default because
+    commands WAIT during that window rather than failing, so anything walking
+    the mount point (a file manager, a backup job) freezes until the device
+    returns or the window ends.",
         busy = indent(BUSY_HINT, "        "),
         permission = indent(PERMISSION_HINT, "        "),
     )

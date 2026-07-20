@@ -52,26 +52,30 @@ umount /mnt/phone            # Linux
 diskutil unmount /mnt/phone  # macOS
 ```
 
-Give a worn-out cable more (or less) room to recover:
+Ride out a worn-out cable that keeps dropping the link (off by default, see below):
 
 ```sh
-mtp-mount --reconnect-timeout 60 /mnt/phone  # wait a minute for the device to come back
-mtp-mount --reconnect-timeout 0 /mnt/phone   # don't wait at all, unmount on the first drop
+mtp-mount --reconnect-timeout 30 /mnt/phone  # wait half a minute for the device to come back
+mtp-mount --reconnect-timeout 60 /mnt/phone  # wait a minute
 ```
 
 Run `mtp-mount --help` for the full list of flags, examples, and troubleshooting tips.
 
 ## When the cable glitches
 
-Old and worn USB cables drop the device for a second and bring it back. `mtp-mount` rides that out:
+Old and worn USB cables drop the device for a second and bring it back. `mtp-mount` can ride that out, but you have to
+ask for it: pass `--reconnect-timeout SECONDS`.
 
 - The mount stays up, and the device is reopened by serial number, so a replug can't land you on a different phone.
 - Filesystem calls made while the device is away **wait** for it instead of failing, and they resume once it's back.
   Files you have open keep working, bytes already read stay cached, and a file you were writing still uploads.
-- The wait is capped by `--reconnect-timeout` (30 seconds by default), so nothing hangs forever. Set it to `0` to fail
-  fast instead.
 - If the device doesn't come back in time, `mtp-mount` prints why and unmounts, rather than leaving a mount point that
   answers every command with an I/O error.
+
+**It's off by default because waiting blocks.** Calls don't fail during the window, they hang, and that includes
+anything else touching the mount point: a file manager listing it, a backup job walking it. On a device that's really
+gone, a 30-second freeze across the desktop is a worse default than a mount that goes away. Turn it on when you're
+fighting a specific cable, and pick a window you'd be happy waiting out.
 
 MTP identifies files by session-scoped handles, so all of them go stale the moment the device reconnects. `mtp-mount`
 looks each one up again by path, keeping inode numbers unchanged, which is what lets already-open files carry on.

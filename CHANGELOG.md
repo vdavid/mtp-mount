@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **A cable glitch no longer kills the mount.** When the device disconnects, `mtp-mount` keeps the mount alive and reopens the same device (matched on serial number) as soon as it's back, then carries on: open file descriptors keep reading, cached read data stays, and a write that was still spooling is uploaded once the device returns. Filesystem calls block while the reconnect is in flight instead of failing, and never longer than the window.
-- **`--reconnect-timeout <SECONDS>`** (default 30) sets how long to wait for a device that went away. `0` turns reconnection off: the first disconnect unmounts right away. When the window runs out, `mtp-mount` says so and unmounts, instead of leaving a mount that answers every call with `EIO`.
+- **A cable glitch no longer has to kill the mount** (opt in with `--reconnect-timeout`). When the device disconnects, `mtp-mount` keeps the mount alive and reopens the same device (matched on serial number) as soon as it's back, then carries on: open file descriptors keep reading, cached read data stays, and a write that was still spooling is uploaded once the device returns. Filesystem calls block while the reconnect is in flight instead of failing, and never longer than the window.
+- **`--reconnect-timeout <SECONDS>`** sets how long to wait for a device that went away. **Off by default** (`0`): the first disconnect unmounts right away. Waiting is opt-in because it blocks rather than fails, so on a device that's genuinely gone every process touching the mount point, a file manager or a backup job included, freezes for the whole window. When the window runs out, `mtp-mount` says so and unmounts, instead of leaving a mount that answers every call with `EIO`.
 
 ### Fixed
 

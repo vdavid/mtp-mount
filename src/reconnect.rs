@@ -26,8 +26,14 @@ impl Default for ReconnectPolicy {
 }
 
 impl ReconnectPolicy {
-    /// Default reconnect window, in seconds.
-    pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+    /// Default reconnect window, in seconds. Off.
+    ///
+    /// Waiting is opt-in because the wait BLOCKS the mount: a file manager that
+    /// walks the mount point would freeze for the whole window on a device
+    /// that's really gone, and a stalled file manager is a worse default than
+    /// a mount that goes away. Users fighting a flaky cable turn it on with
+    /// `--reconnect-timeout`.
+    pub const DEFAULT_TIMEOUT_SECS: u64 = 0;
 
     /// Builds a policy that gives the device `secs` seconds to come back.
     /// Zero disables reconnection: the mount gives up on the first disconnect.
@@ -87,12 +93,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_thirty_seconds() {
-        assert_eq!(
-            ReconnectPolicy::default().timeout(),
-            Duration::from_secs(30)
-        );
-        assert!(!ReconnectPolicy::default().is_disabled());
+    fn default_is_disabled() {
+        // Waiting blocks every process touching the mount point, not just the
+        // one transferring, so a device that's really gone would freeze a file
+        // manager for the whole window. Opt in per-cable instead. Turning this
+        // back on means solving the blocking first (see AGENTS.md).
+        assert_eq!(ReconnectPolicy::default().timeout(), Duration::ZERO);
+        assert!(ReconnectPolicy::default().is_disabled());
     }
 
     #[test]
