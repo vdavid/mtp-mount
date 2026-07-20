@@ -58,7 +58,7 @@ impl Default for MountSpec {
 struct VirtualOpener {
     config: VirtualDeviceConfig,
     unplug: UnplugSwitch,
-    opens: AtomicU32,
+    opens: Arc<AtomicU32>,
 }
 
 impl DeviceOpener for VirtualOpener {
@@ -91,6 +91,11 @@ impl DeviceOpener for VirtualOpener {
 struct TestMount {
     mount_point: TempDir,
     backing_dir: TempDir,
+    /// Serial of the virtual device behind this mount, for the `mtp-rs`
+    /// registry hooks that reach the device directly.
+    serial: String,
+    /// How many times the mount has opened (or reopened) the device.
+    opens: Arc<AtomicU32>,
     fetch_counter: Arc<AtomicU64>,
     unplug: UnplugSwitch,
     shutdown: Arc<Shutdown>,
@@ -159,12 +164,13 @@ impl TestMount {
 
         // Only the fields this suite actually exercises; the rest come from
         // `VirtualDeviceConfig::default()`, so a new mtp-rs field can't break the build.
+        let serial = format!(
+            "test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
         let config = VirtualDeviceConfig {
-            serial: format!(
-                "test-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ),
+            serial: serial.clone(),
             storages,
             // Stated even though they match the defaults: both are load-bearing here. Reads go
             // through `Storage::read_range`, so the device must offer a partial-read op, and
@@ -185,10 +191,11 @@ impl TestMount {
         let handle = rt.handle().clone();
 
         let unplug = UnplugSwitch::default();
+        let opens = Arc::new(AtomicU32::new(0));
         let opener = Arc::new(VirtualOpener {
             config,
             unplug: unplug.clone(),
-            opens: AtomicU32::new(0),
+            opens: Arc::clone(&opens),
         });
         let device = opener.open(&handle).expect("failed to open virtual device");
 
@@ -247,6 +254,8 @@ impl TestMount {
         TestMount {
             mount_point,
             backing_dir,
+            serial,
+            opens,
             fetch_counter,
             unplug,
             shutdown,
@@ -302,6 +311,23 @@ impl TestMount {
     /// Path to the backing directory that the virtual device serves from.
     fn backing_path(&self) -> &Path {
         self.backing_dir.path()
+    }
+
+    /// Make the device re-key an object's handle, the way Android's
+    /// MediaProvider does across a media rescan: the file stays put, the handle
+    /// the mount cached stops resolving.
+    fn rekey(&self, rel_path: &str) {
+        mtp_rs::transport::virtual_device::registry::rekey_virtual_object(
+            &self.serial,
+            Path::new(rel_path),
+        )
+        .expect("the object must be tracked, so list its parent first");
+    }
+
+    /// How many times the mount has opened the device (one at startup, one per
+    /// reconnect).
+    fn open_count(&self) -> u32 {
+        self.opens.load(Ordering::SeqCst)
     }
 }
 
@@ -988,6 +1014,67 @@ fn test_write_spool_survives_reconnect() {
         fs::read_to_string(&landed).unwrap_or_default()
             == "bytes that were spooled while the cable was fine"
     });
+}
+
+// =============================================================================
+// Stale handles (the device re-keys an object out from under the mount)
+// =============================================================================
+
+#[test]
+#[ignore]
+fn test_stale_handle_is_recovered_by_re_resolving() {
+    let content = "the device re-keyed me while nobody was looking";
+    let mount = TestMount::with_setup(|backing| {
+        fs::write(backing.join("rekeyed.txt"), content).unwrap();
+        fs::write(backing.join("other.txt"), "untouched").unwrap();
+    });
+
+    // Listing caches the handles, which is the precondition for the bug: a
+    // later operation uses a token the device has already thrown away.
+    let storage = mount.storage_path();
+    fs::read_dir(&storage).expect("read_dir failed").count();
+
+    mount.rekey("rekeyed.txt");
+
+    // First read of this file, so the kernel page cache can't answer it: the
+    // request reaches the mount, which hits the dead handle and has to
+    // re-resolve instead of failing with EIO.
+    let read_back = fs::read_to_string(storage.join("rekeyed.txt"))
+        .expect("a re-keyed handle must be re-resolved, not surfaced as EIO");
+    assert_eq!(read_back, content);
+}
+
+#[test]
+#[ignore]
+fn test_stale_handle_does_not_reopen_the_device() {
+    // A stale handle means the token died, not the session. Reopening would be
+    // wrong and expensive (on Android it can wedge the device), so pin it down
+    // through the opener the mount actually uses.
+    let mount = TestMount::with_setup(|backing| {
+        fs::write(backing.join("rekeyed.bin"), vec![9u8; 4096]).unwrap();
+    });
+
+    let storage = mount.storage_path();
+    fs::read_dir(&storage).expect("read_dir failed").count();
+    let opens_before = mount.open_count();
+
+    mount.rekey("rekeyed.bin");
+    assert_eq!(
+        fs::read(storage.join("rekeyed.bin")).expect("read failed"),
+        vec![9u8; 4096]
+    );
+
+    assert_eq!(
+        mount.open_count(),
+        opens_before,
+        "recovering from a stale handle must not reopen the device"
+    );
+    assert_eq!(
+        mount.shutdown_reason(),
+        None,
+        "a stale handle is not a reason to take the mount down"
+    );
+    assert!(mount.is_mounted());
 }
 
 // Note: files larger than 4 GB can't be tested via the virtual device because

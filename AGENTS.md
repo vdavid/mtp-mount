@@ -75,9 +75,9 @@ mtp-rs (MtpDevice, Storage + next_event)
 
 A flaky cable drops the device and brings it back. The mount stays up, reopens the same device, and resumes.
 
-**The flow.** Every MTP call goes through `MtpFs::with_reconnect`, which runs a closure, and on a session-loss error (`device::is_link_lost`: `Disconnected`, `DeviceReset`, `NoDevice`) calls `reconnect()` and runs the closure again, up to `MAX_ATTEMPTS`. `reconnect()` sleeps through `ReconnectPolicy::schedule()` (capped exponential backoff, total exactly the window), asking the `DeviceOpener` for the device each time. Success goes to `adopt()`; running out of window calls `give_up()`.
+**The flow.** Every MTP call goes through `MtpFs::with_recovery`, which runs a closure, and on a session-loss error (`device::is_link_lost`: `Disconnected`, `DeviceReset`, `NoDevice`) calls `reconnect()` and runs the closure again, up to `MAX_ATTEMPTS`. `reconnect()` sleeps through `ReconnectPolicy::schedule()` (capped exponential backoff, total exactly the window), asking the `DeviceOpener` for the device each time. Success goes to `adopt()`; running out of window calls `give_up()`.
 
-**Why the closure, not the call.** `with_reconnect` re-runs the whole closure, and each closure re-resolves its own handles and storage index. A closure that captured a handle from the dead session would retry with a token the new session has never heard of.
+**Why the closure, not the call.** `with_recovery` re-runs the whole closure, and each closure re-resolves its own handles and storage index. A closure that captured a handle from the dead session would retry with a token the new session has never heard of.
 
 **Handles: lazy re-resolution by path, inodes fixed.** `ObjectHandle` and `StorageId` are session-scoped opaque tokens, so a reconnect invalidates every one of them. FUSE inode numbers must NOT change: the kernel caches them and open file descriptors point at them, so renumbering breaks reads on an fd that was open across the glitch. So `adopt()` keeps the inode tree exactly as it is and only bumps `InodeTable`'s generation counter, which marks every cached handle stale. `ensure_fresh(inode)` then re-resolves on demand: it walks up to the storage root, then lists back down matching each component by name, writing fresh handles into the same inodes via `set_handle`. Lazy beats eager here because most inodes are never touched again, and a big tree would make the reconnect itself slow.
 
@@ -88,6 +88,34 @@ Storage IDs are re-mapped eagerly instead (there are only a few): `adopt()` matc
 **Blocking, and why reconnect is OFF by default.** A FUSE call that hits the disconnect blocks (holding the inner lock, so the mount is effectively frozen) until the device returns or the window expires. Waiting beats an `EIO` that makes `cp` abandon a 4 GB copy, which is why the behavior exists at all. But it blocks EVERY process touching the mount point, not just the one doing the transfer, so a file manager or backup job walking the mount freezes for the whole window on a device that's really gone. A frozen desktop is a worse default than a mount that disappears, so `ReconnectPolicy::DEFAULT_TIMEOUT_SECS` is `0` and users opt in per-cable. Don't flip the default back without solving the blocking (that means not holding the inner lock across the wait, which in turn needs `fuser`'s `n_threads` raised above 1).
 
 **Giving up.** `give_up()` prints why and raises the `Shutdown` signal. It can't unmount itself: a FUSE callback holds the inode lock and still owes the kernel a reply, and `fuser` hands the unmount handle to whoever mounted the filesystem. So `main` (and the test harness) watch the signal and call `umount_and_join`. That's also why `main` uses `spawn_mount2` rather than `mount2`: `Session::run` is `pub(crate)`, so the only way to keep a thread free for the watch loop is the background session.
+
+## Surviving a re-keyed handle
+
+Android's MediaProvider re-keys object IDs across a media rescan, so a handle the mount cached when it
+last listed a folder is silently invalidated. `mtp-rs` reports that as `Error::StaleHandle`
+(`is_stale_handle()`, mapped from `InvalidObjectHandle`/`InvalidParentObject`) and its own docs are
+explicit that a host must re-list the parent, re-resolve, and retry once rather than fail. Before this
+existed, a write-then-read-back on a device with a live rescan came back as `EIO`.
+
+**It is a sibling of the reconnect path, not a member of it.** `with_recovery` handles both, but a stale
+handle takes a different branch: the session is fine and only the token is dead, so it calls
+`MtpFs::invalidate_handles` (bump the `InodeTable` generation, drop the cached listings) and re-runs the
+closure immediately, against the same device. **Never route it through `reconnect()`.** Reopening a
+healthy device is a real regression: on Android a reopen is expensive and can wedge the device, and the
+mount would freeze for the whole reconnect window over a token that a single listing would have fixed.
+`is_link_lost` is what decides a reopen, and `StaleHandle` must stay out of it.
+
+**One retry, on its own budget.** `MAX_STALE_RETRIES` is 1, per `mtp-rs`'s guidance: the first
+`StaleHandle` means a re-key, and a fresh listing has the new token. A second one for the same operation
+means the freshly resolved token died too, which isn't a re-key any more, so the error goes to the
+caller instead of looping. The budget is separate from `MAX_ATTEMPTS` because the two failures cost
+different things (a listing against a healthy session versus a reopen plus a backoff wait), and because
+a stale handle must never fall through into the reconnect path when it runs out.
+
+**Whole-table invalidation, lazily re-resolved.** `invalidate_handles` marks every cached handle stale
+rather than just the one that failed. A device that re-keys re-keys in batches, so the neighbours are
+suspect too, and the generation counter makes marking free: `ensure_fresh` re-resolves by path on
+demand, so the only inodes that pay for a listing are the ones something touches again.
 
 ## The daemon (`mtp-mountd`)
 
@@ -149,7 +177,7 @@ notices a dead session on its next operation, the USB watch only on its next pol
 ## Testing
 
 - **Unit tests** (93): inode table, write buffer, sparse cache, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal, mount-root resolution, device directory naming, mountpoint detection, stale-mount sweep. Run with `cargo test`.
-- **Integration tests** (27): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring, partial reads, and reconnects. Linux only (needs `libfuse3-dev`), except the one non-ignored test below. Run with `cargo test --test integration -- --ignored --test-threads=1`
+- **Integration tests** (29): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring, partial reads, and reconnects. Linux only (needs `libfuse3-dev`), except the one non-ignored test below. Run with `cargo test --test integration -- --ignored --test-threads=1`
 - **Daemon tests** (8, `tests/daemon.rs`): drive `Supervisor` through its command channel and assert against the real filesystem. Linux only, `cargo test --test daemon -- --ignored --test-threads=1`. See below.
 
 ### Testing a disconnect
@@ -172,9 +200,11 @@ worth keeping:
   `MTP_MOUNTD_TEST_STALE_*`), waits for it to mount, `SIGKILL`s it, and then sweeps. That's the only way to reach the
   `ENOTCONN` branch in `is_mountpoint`.
 
-The virtual devices here set `watch_backing_dirs: false` and `event_poll_interval: ZERO`. With the watcher on, the
-mount's own writes land in the backing dir, the watcher re-keys object handles, and a write-then-read fails with a
-stale handle: real Android behavior, covered by the other suite, pure noise here.
+The virtual devices here run with the backing-dir watcher ON, and that's load-bearing. The mount's own writes land in
+the backing dir, the watcher re-keys the object handles, and the write-then-read-back in
+`two_devices_mount_at_distinct_paths_and_work_independently` runs straight into a stale handle. That's the exact bug
+"Surviving a re-keyed handle" fixes, so the suite is a regression test for it: turn the watcher off and the coverage
+is gone (verified by reverting the fix, which fails that test with `EIO`).
 
 - All tests validated on Linux (Ubuntu, aarch64)
 
@@ -200,7 +230,7 @@ stale handle: real Android behavior, covered by the other suite, pure noise here
 
 - **Minimal**: correct POSIX subset, not everything
 - **No data loss**: safe flush sequence protects against upload failures
-- **Well-tested**: 128 tests, virtual device integration, no hardware needed
+- **Well-tested**: 130 tests, virtual device integration, no hardware needed
 
 ## Things to avoid
 

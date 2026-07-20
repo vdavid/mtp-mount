@@ -36,6 +36,22 @@ const UPLOAD_CHUNK: usize = 65536;
 /// keeps dropping mid-operation, and past that the retry is not the answer.
 const MAX_ATTEMPTS: u32 = 3;
 
+/// How many times an operation re-resolves its handles and tries again after
+/// the device says a handle is stale.
+///
+/// One, which is what `mtp-rs` prescribes: the first `StaleHandle` means the
+/// device re-keyed the object and a fresh listing has the new token, so the
+/// retry works. A second one for the same operation means the re-resolved token
+/// died too, which isn't a re-key any more; looping on it would hammer the
+/// device instead of telling the caller.
+///
+/// This budget is deliberately separate from [`MAX_ATTEMPTS`]: the two failures
+/// have nothing in common. A stale handle costs one listing against a healthy
+/// session, a dead link costs a reopen and a backoff wait, so spending one
+/// shouldn't shorten the other, and a stale handle must never fall through into
+/// the reconnect path.
+const MAX_STALE_RETRIES: u32 = 1;
+
 type MtpResult<T> = Result<T, mtp_rs::Error>;
 
 /// Everything the mount needs beyond the device itself.
@@ -272,27 +288,67 @@ impl MtpFs {
         }
     }
 
-    /// Runs an MTP operation, riding out a disconnect if one happens.
+    /// Runs an MTP operation, riding out the two ways its handles can die under
+    /// it: the device went away, or the device re-keyed the object.
     ///
-    /// `attempt` is re-run from scratch after a successful reconnect, so it must
+    /// `attempt` is re-run from scratch after either recovery, so it must
     /// resolve its own handles (through [`Self::file_handle`] and friends) rather
-    /// than close over handles from the dead session.
-    fn with_reconnect<T>(
+    /// than close over handles from the previous try.
+    ///
+    /// The two paths are siblings, not variations. A dead link needs a reopen
+    /// and a wait; a stale handle needs neither, because the session is fine and
+    /// only the token is dead, so it re-resolves by path and retries straight
+    /// away. Reopening a healthy device would be a real regression: on Android
+    /// a reopen is expensive and can wedge the device.
+    fn with_recovery<T>(
         &self,
         inner: &mut Inner,
         mut attempt: impl FnMut(&Self, &mut Inner) -> MtpResult<T>,
     ) -> MtpResult<T> {
         for _ in 0..MAX_ATTEMPTS {
-            if !self.unplug.is_unplugged() {
+            // Stale-handle retries happen against the current session, on their
+            // own budget, and never fall through to the reconnect below.
+            let mut stale_retries = MAX_STALE_RETRIES;
+            loop {
+                if self.unplug.is_unplugged() {
+                    break;
+                }
                 match attempt(self, inner) {
                     Ok(value) => return Ok(value),
+                    Err(e) if e.is_stale_handle() => {
+                        if stale_retries == 0 {
+                            error!("Operation still hit a stale object handle after re-resolving");
+                            return Err(e);
+                        }
+                        stale_retries -= 1;
+                        debug!("Operation hit a stale object handle, re-resolving by path");
+                        Self::invalidate_handles(inner);
+                    }
                     Err(e) if !is_link_lost(&e) => return Err(e),
-                    Err(e) => debug!("Operation hit a dead session: {e}"),
+                    Err(e) => {
+                        debug!("Operation hit a dead session: {e}");
+                        break;
+                    }
                 }
             }
             self.reconnect(inner)?;
         }
         Err(mtp_rs::Error::Disconnected)
+    }
+
+    /// Marks every cached object handle stale so the next use re-resolves it by
+    /// path, and drops the cached listings that produced them.
+    ///
+    /// Whole-table rather than just the inode that failed, for two reasons. A
+    /// device that re-keys re-keys in batches (Android's MediaProvider does it
+    /// across a whole media rescan), so the neighbours are suspect too. And the
+    /// generation counter makes marking free: re-resolution is lazy, so the only
+    /// inodes that pay for a listing are the ones something actually touches
+    /// again. This is the same mechanism a reconnect uses, minus the reopen.
+    fn invalidate_handles(inner: &mut Inner) {
+        inner.inodes.bump_generation();
+        inner.dirs_loaded.clear();
+        inner.dirs_loaded.insert(FUSE_ROOT_INODE, true);
     }
 
     /// Waits for the device to come back and rebuilds the session on top of the
@@ -484,7 +540,7 @@ impl MtpFs {
             return;
         }
 
-        match self.with_reconnect(inner, |fs, inner| fs.list_into_table(inner, parent_inode)) {
+        match self.with_recovery(inner, |fs, inner| fs.list_into_table(inner, parent_inode)) {
             Ok(()) => {
                 inner.dirs_loaded.insert(parent_inode, true);
             }
@@ -554,7 +610,7 @@ impl MtpFs {
         };
 
         let mut attempts = 0u32;
-        self.with_reconnect(inner, |fs, inner| {
+        self.with_recovery(inner, |fs, inner| {
             let mut attempt = file.try_clone().map_err(io_error)?;
             attempt.seek(SeekFrom::Start(0)).map_err(io_error)?;
             attempts += 1;
@@ -1095,7 +1151,7 @@ impl Filesystem for MtpFs {
         // Fetch missing ranges. `read_range` uses the 64-bit partial-read op to
         // support offsets beyond 4 GB. Each USB transfer is capped at 1 MB to keep
         // latency reasonable.
-        // Each chunk resolves the object handle again inside `with_reconnect`,
+        // Each chunk resolves the object handle again inside `with_recovery`,
         // so a read that spans a cable glitch picks up the new session's handle
         // and carries on from the byte it stopped at.
         const CHUNK: u64 = 1024 * 1024;
@@ -1104,7 +1160,7 @@ impl Filesystem for MtpFs {
             while cursor < range.end {
                 let chunk_size = (range.end - cursor).min(CHUNK) as u32;
                 self.fetch_counter.fetch_add(1, Ordering::Relaxed);
-                let bytes = match self.with_reconnect(&mut inner, |fs, inner| {
+                let bytes = match self.with_recovery(&mut inner, |fs, inner| {
                     let handle = fs.file_handle(inner, ino.0)?;
                     let storage_idx =
                         Self::find_storage_index(inner, ino.0).ok_or(mtp_rs::Error::NotFound)?;
@@ -1248,7 +1304,7 @@ impl Filesystem for MtpFs {
             return;
         }
 
-        let handle = match self.with_reconnect(&mut inner, |fs, inner| {
+        let handle = match self.with_recovery(&mut inner, |fs, inner| {
             let mtp_parent = fs.parent_handle(inner, parent_ino)?;
             let storage_idx =
                 Self::find_storage_index(inner, parent_ino).ok_or(mtp_rs::Error::NotFound)?;
@@ -1320,7 +1376,7 @@ impl Filesystem for MtpFs {
             return;
         }
 
-        let handle = match self.with_reconnect(&mut inner, |fs, inner| {
+        let handle = match self.with_recovery(&mut inner, |fs, inner| {
             let mtp_parent = fs.parent_handle(inner, parent_ino)?;
             let storage_idx =
                 Self::find_storage_index(inner, parent_ino).ok_or(mtp_rs::Error::NotFound)?;
@@ -1375,7 +1431,7 @@ impl Filesystem for MtpFs {
             return;
         }
 
-        if let Err(e) = self.with_reconnect(&mut inner, |fs, inner| {
+        if let Err(e) = self.with_recovery(&mut inner, |fs, inner| {
             let handle = fs.file_handle(inner, child_ino)?;
             let storage_idx =
                 Self::find_storage_index(inner, child_ino).ok_or(mtp_rs::Error::NotFound)?;
@@ -1423,7 +1479,7 @@ impl Filesystem for MtpFs {
             return;
         }
 
-        if let Err(e) = self.with_reconnect(&mut inner, |fs, inner| {
+        if let Err(e) = self.with_recovery(&mut inner, |fs, inner| {
             let handle = fs.object_handle(inner, child_ino)?;
             let storage_idx =
                 Self::find_storage_index(inner, child_ino).ok_or(mtp_rs::Error::NotFound)?;
@@ -1495,7 +1551,7 @@ impl Filesystem for MtpFs {
         }
 
         if name_str != newname_str {
-            if let Err(e) = self.with_reconnect(&mut inner, |fs, inner| {
+            if let Err(e) = self.with_recovery(&mut inner, |fs, inner| {
                 let handle = fs.object_handle(inner, child_ino)?;
                 let storage_idx =
                     Self::find_storage_index(inner, child_ino).ok_or(mtp_rs::Error::NotFound)?;
@@ -1509,7 +1565,7 @@ impl Filesystem for MtpFs {
         }
 
         if parent_ino != newparent_ino {
-            if let Err(e) = self.with_reconnect(&mut inner, |fs, inner| {
+            if let Err(e) = self.with_recovery(&mut inner, |fs, inner| {
                 let handle = fs.object_handle(inner, child_ino)?;
                 let storage_idx =
                     Self::find_storage_index(inner, child_ino).ok_or(mtp_rs::Error::NotFound)?;

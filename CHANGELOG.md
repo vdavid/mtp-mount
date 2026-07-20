@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A phone that re-numbers its files mid-copy no longer breaks the mount.** Android's MediaProvider re-keys object IDs across a media rescan, which silently invalidates the handles the mount cached when it last listed a folder; the next read, write, or delete came back as `EIO` (classically a write-then-read-back of the file you just copied over). The mount now re-resolves the affected handles by path and retries the operation once, which is what MTP hosts are supposed to do. The device is *not* reopened for this: the session is still healthy, only the handle died.
 - **Copying a big file to a device no longer fills RAM.** The flush on `close()` read the whole spool file into memory before sending it, so `cp bigvideo.mp4 /mnt/phone/` still peaked at the file's size in RSS even after the spool itself moved to disk. Uploads now stream from the spool in 64 KiB chunks, so memory stays flat whether the file is 4 MB or 40 GB.
 - **Re-listing a directory no longer changes its files' inode numbers.** Inodes are now reused for entries that are still there under the same name, so an `ls` in one terminal can't break a file another process has open.
 

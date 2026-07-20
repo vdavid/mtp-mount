@@ -141,14 +141,14 @@ impl TestDaemon {
             // offer a partial-read operation for the mount to serve a file.
             supports_partial_object_64: true,
             supports_rename: true,
-            // No backing-dir watcher and no event polling. These tests are
-            // about mounts arriving and leaving, and the watcher re-keys object
-            // handles when the mount's own writes land in the backing dir,
-            // which turns a write-then-read into a stale-handle failure that
-            // has nothing to do with the daemon. The other suite covers the
-            // watcher on purpose; here it's noise.
-            event_poll_interval: Duration::ZERO,
-            watch_backing_dirs: false,
+            // The backing-dir watcher is ON, and it's load-bearing: the mount's
+            // own writes land in the backing dir, the watcher re-keys the object
+            // handles, and the write-then-read-back below then runs straight
+            // into a stale handle. That's real Android behavior, and the mount
+            // recovers from it by re-resolving, so the daemon suite runs with it
+            // on rather than routing around it.
+            event_poll_interval: Duration::from_millis(50),
+            watch_backing_dirs: true,
             ..Default::default()
         };
 
