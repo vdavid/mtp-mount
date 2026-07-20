@@ -4,7 +4,7 @@
 
 # mtp-mount
 
-Mount MTP devices as local filesystems via FUSE. This is pure Rust, _not_ built
+Mount MTP devices as local filesystems via FUSE, with _write_ support! This is pure Rust, _not_ built
 on [libmtp](https://github.com/libmtp/libmtp/).
 
 To use it, plug in your Android phone or camera, run `mtp-mount /mnt/phone`, and use `ls`, `cp`, `cat`, `rm`, `mv`
@@ -63,7 +63,7 @@ Run `mtp-mount --help` for the full list of flags, examples, and troubleshooting
 - **Rename and move**: `mv`
 - **Large files**: files larger than 4 GB read end-to-end (no 32-bit truncation)
 
-## What doesn't (and why)
+## What doesn't work (and why)
 
 MTP is an object-based protocol, not a block device, so some POSIX features just don't map:
 
@@ -87,12 +87,29 @@ The FUSE layer translates filesystem calls into MTP operations:
   `MtpDevice::next_event()` and invalidates entries when files are added, removed, or modified on the device itself (so
   taking a photo while the phone is mounted just shows up).
 
+## Why gvfs can't write (and this can)
+
+On most Linux desktops, MTP goes through gvfs, and gvfs can't write. This happens:
+
+```
+$ cp photo.jpg "/run/user/1000/gvfs/mtp:host=Pixel_9/Internal shared storage/DCIM/"
+cp: cannot create regular file '...': Operation not supported
+```
+
+That's not really a gvfs bug, it's a mismatch between two designs. POSIX opens a file and starts writing without knowing
+how big it will be. MTP wants the size up front, in `SendObjectInfo`, before you send a single byte. gvfs gives up and
+returns `EOPNOTSUPP`. People have been hitting this for ~20 years.
+
+`mtp-mount` spools the file locally while you write, then uploads it on `close()`, when the size is finally known. So
+`cp`, `rsync`, and "save as" from any app work the way you'd expect.
+
 ## Requirements
 
 You need a FUSE implementation:
 
 - **Linux**: `sudo apt install libfuse3-dev` (Debian/Ubuntu) or `fuse3` (Fedora/Arch)
-- **macOS**: [macFUSE](https://osxfuse.github.io/) or [FUSE-T](https://www.fuse-t.org/) (may need manual `pkg-config` wiring)
+- **macOS**: [macFUSE](https://osxfuse.github.io/) or [FUSE-T](https://www.fuse-t.org/) (may need manual `pkg-config`
+  wiring)
 
 ## Build from source
 
