@@ -54,9 +54,9 @@ impl TestMount {
 
         setup(backing_dir.path());
 
+        // Only the fields this suite actually exercises; the rest come from
+        // `VirtualDeviceConfig::default()`, so a new mtp-rs field can't break the build.
         let config = VirtualDeviceConfig {
-            manufacturer: "Test".into(),
-            model: "Virtual Device".into(),
             serial: format!("test-{}", std::process::id()),
             storages: vec![VirtualStorageConfig {
                 description: "Internal Storage".into(),
@@ -64,10 +64,11 @@ impl TestMount {
                 backing_dir: backing_dir.path().to_path_buf(),
                 read_only: false,
             }],
+            // Stated even though they match the defaults: both are load-bearing here. Reads go
+            // through `Storage::read_range`, so the device must offer a partial-read op, and
+            // `test_rename_file` needs rename support. If a default ever flips, this suite should
+            // keep testing what it means to test.
             supports_rename: true,
-            // Reads go through `Storage::read_range`, so the device must offer a
-            // partial-read op. `true` picks `GetPartialObject64`, matching the
-            // Android phones this is aimed at.
             supports_partial_object_64: true,
             event_poll_interval: if watch_events {
                 Duration::from_millis(50)
@@ -75,6 +76,7 @@ impl TestMount {
                 Duration::ZERO
             },
             watch_backing_dirs: watch_events,
+            ..Default::default()
         };
 
         let rt = tokio::runtime::Runtime::new().expect("failed to create runtime");
