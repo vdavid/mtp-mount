@@ -22,6 +22,7 @@ src/
   inode.rs         # Inode table: maps FUSE inodes <-> MTP object handles
   buffer.rs        # Write buffer: temp-file-backed, flushes to MTP on close
   hints.rs         # Remedies for device-open failures, shared with --help
+  spool.rs         # Resolves and prepares the disk-backed spool directory
   sparse_cache.rs  # Byte-range cache for on-demand partial reads
   error.rs         # MountError enum
 tests/
@@ -44,7 +45,8 @@ mtp-rs (MtpDevice, Storage + next_event)
 
 **Key design choices:**
 - **Reads** are byte-range on-demand via `Storage::read_range`. Each open file handle has a `SparseCache` (tempfile + sorted `Vec<Range<u64>>` of populated ranges). FUSE `read(offset, size)` asks the cache for missing ranges, fetches them in 1 MB chunks, writes them into the tempfile, and serves the requested slice. No full-file download on open; supports files > 4 GB.
-- **Writes** buffer to a temp file (`tempfile::tempfile()`), flushed to MTP on `release`.
+- **Writes** buffer to a temp file in the spool dir, flushed to MTP on `release`.
+- **Spool directory**: both temp files (write buffers and sparse read caches) are created with `tempfile::tempfile_in(spool_dir)`, never plain `tempfile::tempfile()`. `$TMPDIR` is a tmpfs on most current Linux distros, so a whole-file write buffer there is RAM and a big `cp` OOMs. `spool.rs::resolve_spool_dir` is pure (env values in, path out) and picks `$XDG_CACHE_HOME/mtp-mount/spool` → `$HOME/.cache/mtp-mount/spool` on Linux, `$HOME/Library/Caches/mtp-mount/spool` on macOS; `--spool-dir` overrides. `main` resolves and prepares it *before* opening the device, and exits with the path named if it isn't writable. Never fall back to `$TMPDIR` on failure: that restores the OOM bug invisibly. The files stay **unlinked**, so a crash reclaims the space with no cleanup pass; don't switch them to named temp files.
 - **Overwrites** use upload-then-delete-then-rename when the device supports rename. Falls back to delete-then-upload otherwise (with a warning log).
 - **Async bridge:** fuser callbacks are sync, mtp-rs is async. Uses `tokio::runtime::Handle::block_on()` to bridge.
 - **Locking:** single `Arc<Mutex<Inner>>` serializes all FUSE callbacks. Shared with the event monitor task. Acceptable because fuser already serializes per-mount.
@@ -52,7 +54,7 @@ mtp-rs (MtpDevice, Storage + next_event)
 
 ## Testing
 
-- **Unit tests** (48): inode table, write buffer, sparse cache, device-open hints. Run with `cargo test`.
+- **Unit tests** (56): inode table, write buffer, sparse cache, spool-dir resolution, device-open hints. Run with `cargo test`.
 - **Integration tests** (21): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring and partial reads. Linux only (needs `libfuse3-dev`). Run with `cargo test --test integration -- --ignored --test-threads=1`
 - All tests validated on Linux (Ubuntu, aarch64)
 
@@ -76,7 +78,7 @@ mtp-rs (MtpDevice, Storage + next_event)
 
 - **Minimal**: correct POSIX subset, not everything
 - **No data loss**: safe flush sequence protects against upload failures
-- **Well-tested**: 69 tests, virtual device integration, no hardware needed
+- **Well-tested**: 77 tests, virtual device integration, no hardware needed
 
 ## Things to avoid
 

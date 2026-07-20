@@ -79,7 +79,8 @@ The FUSE layer translates filesystem calls into MTP operations:
 - **Reads are byte-range on-demand.** Each FUSE `read(offset, size)` fetches only the missing bytes via MTP's
   `GetPartialObject64`, writes them into a sparse tempfile, and serves the requested slice. Repeated reads of the same
   region hit the local cache. Scrubbing a 10 GB video only downloads what you actually touch.
-- **Writes buffer to a tempfile**, then flush to the device on close.
+- **Writes spool to disk**, then flush to the device on close. The spool lives in your cache directory, not `/tmp`:
+  on most current Linux distros `/tmp` is a tmpfs (RAM), and a 4 GB upload buffered there would fill memory.
 - **Overwrites use a safe upload-then-delete-then-rename sequence** when the device supports rename. So if the upload
   fails, the original is still there. Falls back to delete-then-upload with a warning log on devices that don't support
   rename.
@@ -103,7 +104,22 @@ returns `EOPNOTSUPP`. People have been hitting this for ~20 years.
 `mtp-mount` spools the file locally while you write, then uploads it on `close()`, when the size is finally known. So
 `cp`, `rsync`, and "save as" from any app work the way you'd expect.
 
+### Where the spool lives
+
+Writes (and the read cache) go to unlinked temp files under:
+
+- **Linux**: `$XDG_CACHE_HOME/mtp-mount/spool`, or `~/.cache/mtp-mount/spool` when `XDG_CACHE_HOME` is unset
+- **macOS**: `~/Library/Caches/mtp-mount/spool`
+
+Point it somewhere else with `--spool-dir /path/to/dir`, for example when your home directory is small and you're
+copying a 60 GB video off a phone. The directory is created if missing, and `mtp-mount` won't start if it can't write
+there. The files are unlinked, so their space comes back on its own if the process stops, and nothing is left behind
+to clean up.
+
 ## Requirements
+
+Disk space for the spool: copying a file to or from the device buffers it under your cache directory first, so keep
+roughly as much free space there as the largest file you'll transfer (or pass `--spool-dir`).
 
 You need a FUSE implementation:
 
@@ -133,7 +149,7 @@ Integration tests mount a virtual MTP device via FUSE (Linux only, needs `libfus
 cargo test --test integration -- --ignored --test-threads=1
 ```
 
-69 tests total (48 unit + 21 integration), all passing on Linux. The integration tests use `mtp-rs`'s virtual device
+77 tests total (56 unit + 21 integration), all passing on Linux. The integration tests use `mtp-rs`'s virtual device
 transport, so CI runs without any physical hardware.
 
 ## License

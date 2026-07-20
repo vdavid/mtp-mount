@@ -11,6 +11,7 @@
 
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::ops::Range;
+use std::path::Path;
 
 /// A tempfile-backed cache that tracks populated byte ranges.
 #[derive(Debug)]
@@ -24,10 +25,12 @@ pub struct SparseCache {
 impl SparseCache {
     /// Create a new sparse cache for a file of the given total size.
     ///
-    /// Allocates a tempfile and sets its length so that sparse reads past the
-    /// end don't accidentally return 0 bytes before the caller has fetched them.
-    pub fn new(total_size: u64) -> io::Result<Self> {
-        let file = tempfile::tempfile()?;
+    /// Allocates an unlinked temp file in `spool_dir` (see [`crate::spool`]; the
+    /// cache holds every byte read so far, so it must not land in a tmpfs) and
+    /// sets its length so that sparse reads past the end don't accidentally
+    /// return 0 bytes before the caller has fetched them.
+    pub fn new(total_size: u64, spool_dir: &Path) -> io::Result<Self> {
+        let file = tempfile::tempfile_in(spool_dir)?;
         file.set_len(total_size)?;
         Ok(Self {
             file,
@@ -136,17 +139,24 @@ impl SparseCache {
 #[allow(clippy::single_range_in_vec_init)] // intentional: asserting populated_ranges matches a one-range slice
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// Unlinked temp files, so the system temp dir is fine for tests; production
+    /// resolves a disk-backed spool dir instead.
+    fn spool() -> PathBuf {
+        std::env::temp_dir()
+    }
 
     #[test]
     fn missing_ranges_empty_cache() {
-        let cache = SparseCache::new(1000).unwrap();
+        let cache = SparseCache::new(1000, &spool()).unwrap();
         assert_eq!(cache.missing_ranges(0, 100), vec![0..100]);
         assert_eq!(cache.missing_ranges(500, 100), vec![500..600]);
     }
 
     #[test]
     fn missing_ranges_full_hit() {
-        let mut cache = SparseCache::new(1000).unwrap();
+        let mut cache = SparseCache::new(1000, &spool()).unwrap();
         cache.write_at(0, &[0u8; 500]).unwrap();
         assert_eq!(cache.missing_ranges(100, 200), Vec::<Range<u64>>::new());
         assert_eq!(cache.missing_ranges(0, 500), Vec::<Range<u64>>::new());
@@ -154,7 +164,7 @@ mod tests {
 
     #[test]
     fn missing_ranges_partial_hit_at_start() {
-        let mut cache = SparseCache::new(1000).unwrap();
+        let mut cache = SparseCache::new(1000, &spool()).unwrap();
         // Populate [0, 100).
         cache.write_at(0, &[0u8; 100]).unwrap();
         // Request [0, 200) — first 100 cached, 100..200 missing.
@@ -163,7 +173,7 @@ mod tests {
 
     #[test]
     fn missing_ranges_partial_hit_at_end() {
-        let mut cache = SparseCache::new(1000).unwrap();
+        let mut cache = SparseCache::new(1000, &spool()).unwrap();
         // Populate [100, 200).
         cache.write_at(100, &[0u8; 100]).unwrap();
         // Request [0, 200) — first 100 missing, last 100 cached.
@@ -172,7 +182,7 @@ mod tests {
 
     #[test]
     fn missing_ranges_gap_in_middle() {
-        let mut cache = SparseCache::new(1000).unwrap();
+        let mut cache = SparseCache::new(1000, &spool()).unwrap();
         cache.write_at(0, &[0u8; 100]).unwrap();
         cache.write_at(200, &[0u8; 100]).unwrap();
         // Request [0, 300) — gap at [100, 200).
@@ -181,7 +191,7 @@ mod tests {
 
     #[test]
     fn missing_ranges_multiple_gaps() {
-        let mut cache = SparseCache::new(1000).unwrap();
+        let mut cache = SparseCache::new(1000, &spool()).unwrap();
         cache.write_at(100, &[0u8; 50]).unwrap();
         cache.write_at(300, &[0u8; 50]).unwrap();
         // Request [0, 400) — gaps at [0,100), [150,300), [350,400).
@@ -193,7 +203,7 @@ mod tests {
 
     #[test]
     fn missing_ranges_clips_to_total_size() {
-        let mut cache = SparseCache::new(500).unwrap();
+        let mut cache = SparseCache::new(500, &spool()).unwrap();
         // Request extends beyond total_size; should clip.
         assert_eq!(cache.missing_ranges(400, 1000), vec![400..500]);
         cache.write_at(400, &[0u8; 100]).unwrap();
@@ -202,13 +212,13 @@ mod tests {
 
     #[test]
     fn missing_ranges_offset_past_end() {
-        let cache = SparseCache::new(100).unwrap();
+        let cache = SparseCache::new(100, &spool()).unwrap();
         assert_eq!(cache.missing_ranges(200, 100), Vec::<Range<u64>>::new());
     }
 
     #[test]
     fn adjacent_ranges_merge() {
-        let mut cache = SparseCache::new(1000).unwrap();
+        let mut cache = SparseCache::new(1000, &spool()).unwrap();
         cache.write_at(0, &[0u8; 100]).unwrap();
         cache.write_at(100, &[0u8; 100]).unwrap();
         assert_eq!(cache.populated_ranges(), &[0..200]);
@@ -216,7 +226,7 @@ mod tests {
 
     #[test]
     fn overlapping_ranges_merge() {
-        let mut cache = SparseCache::new(1000).unwrap();
+        let mut cache = SparseCache::new(1000, &spool()).unwrap();
         cache.write_at(0, &[0u8; 100]).unwrap();
         cache.write_at(50, &[0u8; 100]).unwrap();
         assert_eq!(cache.populated_ranges(), &[0..150]);
@@ -224,7 +234,7 @@ mod tests {
 
     #[test]
     fn disjoint_ranges_preserved() {
-        let mut cache = SparseCache::new(1000).unwrap();
+        let mut cache = SparseCache::new(1000, &spool()).unwrap();
         cache.write_at(0, &[0u8; 100]).unwrap();
         cache.write_at(500, &[0u8; 100]).unwrap();
         assert_eq!(cache.populated_ranges(), &[0..100, 500..600]);
@@ -232,7 +242,7 @@ mod tests {
 
     #[test]
     fn insertion_sorted() {
-        let mut cache = SparseCache::new(1000).unwrap();
+        let mut cache = SparseCache::new(1000, &spool()).unwrap();
         cache.write_at(500, &[0u8; 100]).unwrap();
         cache.write_at(0, &[0u8; 100]).unwrap();
         cache.write_at(300, &[0u8; 50]).unwrap();
@@ -241,7 +251,7 @@ mod tests {
 
     #[test]
     fn write_read_roundtrip() {
-        let mut cache = SparseCache::new(1000).unwrap();
+        let mut cache = SparseCache::new(1000, &spool()).unwrap();
         let data: Vec<u8> = (0..200).map(|i| (i % 256) as u8).collect();
         cache.write_at(100, &data).unwrap();
         let read = cache.read_at(100, 200).unwrap();
@@ -250,7 +260,7 @@ mod tests {
 
     #[test]
     fn read_at_clips_to_total_size() {
-        let mut cache = SparseCache::new(150).unwrap();
+        let mut cache = SparseCache::new(150, &spool()).unwrap();
         cache.write_at(100, &[0u8; 50]).unwrap();
         // Request extends past total_size; should return only the available bytes.
         let read = cache.read_at(100, 200).unwrap();
@@ -259,7 +269,7 @@ mod tests {
 
     #[test]
     fn read_at_past_end_returns_empty() {
-        let mut cache = SparseCache::new(100).unwrap();
+        let mut cache = SparseCache::new(100, &spool()).unwrap();
         let read = cache.read_at(200, 50).unwrap();
         assert_eq!(read, Vec::<u8>::new());
     }
@@ -267,7 +277,7 @@ mod tests {
     #[test]
     fn three_way_merge() {
         // Writing a range that bridges two existing ranges should merge all three.
-        let mut cache = SparseCache::new(1000).unwrap();
+        let mut cache = SparseCache::new(1000, &spool()).unwrap();
         cache.write_at(0, &[0u8; 100]).unwrap();
         cache.write_at(200, &[0u8; 100]).unwrap();
         cache.write_at(100, &[0u8; 100]).unwrap();

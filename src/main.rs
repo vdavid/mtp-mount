@@ -4,6 +4,9 @@ mod fs;
 mod hints;
 mod inode;
 mod sparse_cache;
+mod spool;
+
+use std::path::PathBuf;
 
 use clap::Parser;
 
@@ -39,6 +42,10 @@ struct Cli {
     /// List connected MTP devices and exit
     #[arg(short, long)]
     list: bool,
+
+    /// Directory for spooling writes and read caches (defaults to your cache dir)
+    #[arg(long, value_name = "PATH")]
+    spool_dir: Option<PathBuf>,
 }
 
 /// The hand-written `--help` sections.
@@ -80,6 +87,8 @@ TROUBLESHOOTING:
 
 NOTES:
     Files are uploaded to the device when you close them, not on each write.
+    While a file is open for writing it's spooled to disk under your cache
+    directory (--spool-dir overrides it), so uploads bigger than RAM work.
     MTP doesn't support partial writes, hardlinks, symlinks, or chmod.",
         busy = indent(BUSY_HINT, "        "),
         permission = indent(PERMISSION_HINT, "        "),
@@ -133,6 +142,18 @@ fn main() {
         }
     };
 
+    // Resolved before the device opens: a broken spool dir should fail before
+    // we claim the USB interface, and never silently fall back to a tmpfs $TMPDIR.
+    let spool_dir = match spool::spool_dir_from_env(cli.spool_dir.as_deref())
+        .and_then(|dir| spool::prepare_spool_dir(&dir).map(|()| dir))
+    {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
     let device_label = cli.device.as_deref().unwrap_or("first available device");
     println!("Mounting {device_label} at {mountpoint}...");
 
@@ -159,7 +180,7 @@ fn main() {
         }
     };
 
-    let mtp_fs = MtpFs::new(device, cli.read_only, handle);
+    let mtp_fs = MtpFs::new(device, cli.read_only, handle, spool_dir);
     let mount_options = mtp_fs.mount_options();
 
     let mut config = fuser::Config::default();

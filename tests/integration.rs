@@ -86,7 +86,9 @@ impl TestMount {
             .block_on(MtpDevice::builder().open_virtual(config))
             .expect("failed to open virtual device");
 
-        let mtp_fs = MtpFs::new(device, false, handle);
+        // Unlinked temp files, so the system temp dir is fine here; production
+        // resolves a disk-backed spool dir under the user's cache directory.
+        let mtp_fs = MtpFs::new(device, false, handle, std::env::temp_dir());
         let fetch_counter = mtp_fs.fetch_counter();
         let mount_options = mtp_fs.mount_options();
 

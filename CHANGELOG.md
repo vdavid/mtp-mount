@@ -7,8 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Big writes no longer risk an out-of-memory stop.** Write buffers and read caches spooled to `$TMPDIR`, which is a tmpfs (RAM) on most current Linux distros, so `cp bigvideo.mp4 /mnt/phone/` tried to hold the whole file in memory. They now spool to a disk-backed per-user directory: `$XDG_CACHE_HOME/mtp-mount/spool` (falling back to `~/.cache/mtp-mount/spool`) on Linux, `~/Library/Caches/mtp-mount/spool` on macOS. The files stay unlinked, so their space comes back on its own after a crash.
+
 ### Added
 
+- **`--spool-dir <PATH>`** to put the spool somewhere else, for example a big scratch disk when your home directory is small. `mtp-mount` creates the directory if it's missing and refuses to start (naming the path) if it can't write there, rather than quietly falling back to RAM.
 - **Actionable errors when another process holds the device.** A failed open now says what to do: `gio mount -l` and `systemctl --user mask gvfs-mtp-volume-monitor` for gvfs on Linux and `ptpcamerad` on macOS when the interface is busy, or the udev-rule fix when the OS denies permission. The remedies are shared with the `--help` troubleshooting section, so the two can't drift apart.
 
 ### Changed

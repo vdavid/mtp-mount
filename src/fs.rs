@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::io::{Seek, SeekFrom};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -107,6 +108,8 @@ fn file_stream(
 /// Mutable state protected by `RefCell` so fuser's `&self` callbacks can mutate it.
 struct Inner {
     storages: Vec<Storage>,
+    /// Disk-backed directory for write buffers and read caches (see [`crate::spool`]).
+    spool_dir: PathBuf,
     inodes: InodeTable,
     write_buf: WriteBuffer,
     read_cache: HashMap<u64, SparseCache>,
@@ -129,7 +132,14 @@ pub struct MtpFs {
 }
 
 impl MtpFs {
-    pub fn new(device: MtpDevice, read_only: bool, rt: tokio::runtime::Handle) -> Self {
+    /// `spool_dir` must exist and be writable; resolve it with
+    /// [`crate::spool::spool_dir_from_env`] and [`crate::spool::prepare_spool_dir`].
+    pub fn new(
+        device: MtpDevice,
+        read_only: bool,
+        rt: tokio::runtime::Handle,
+        spool_dir: PathBuf,
+    ) -> Self {
         let event_device = device.clone();
         Self {
             rt,
@@ -137,8 +147,9 @@ impl MtpFs {
             event_device,
             inner: Arc::new(Mutex::new(Inner {
                 storages: Vec::new(),
+                spool_dir: spool_dir.clone(),
                 inodes: InodeTable::new(),
-                write_buf: WriteBuffer::new(),
+                write_buf: WriteBuffer::new(spool_dir),
                 read_cache: HashMap::new(),
                 dirs_loaded: HashMap::new(),
                 fh_to_inode: HashMap::new(),
@@ -741,8 +752,9 @@ impl Filesystem for MtpFs {
 
         // Lazily create a sparse cache for this file handle.
         use std::collections::hash_map::Entry;
+        let spool_dir = inner.spool_dir.clone();
         if let Entry::Vacant(slot) = inner.read_cache.entry(fh_val) {
-            let cache = match SparseCache::new(entry.size) {
+            let cache = match SparseCache::new(entry.size, &spool_dir) {
                 Ok(c) => c,
                 Err(e) => {
                     error!("Failed to create sparse cache: {e}");

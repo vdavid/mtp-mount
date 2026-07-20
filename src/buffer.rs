@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 use crate::error::MountError;
 
-/// Per-file write buffer backed by a temp file.
+/// Per-file write buffer backed by an unlinked temp file in the spool dir.
 pub struct FileBuffer {
     pub inode: u64,
     #[allow(dead_code)]
@@ -15,11 +16,14 @@ pub struct FileBuffer {
 }
 
 impl FileBuffer {
-    pub fn new(inode: u64, original_size: u64) -> io::Result<Self> {
+    /// Creates the backing temp file in `spool_dir`. The whole file being
+    /// written buffers here before upload, so `spool_dir` must be disk-backed
+    /// (see [`crate::spool`]).
+    pub fn new(inode: u64, original_size: u64, spool_dir: &Path) -> io::Result<Self> {
         Ok(Self {
             inode,
             original_size,
-            file: tempfile::tempfile()?,
+            file: tempfile::tempfile_in(spool_dir)?,
             len: 0,
             dirty: false,
         })
@@ -85,18 +89,16 @@ impl FileBuffer {
 /// Manages in-progress file writes, mapping file handles to their buffers.
 pub struct WriteBuffer {
     buffers: HashMap<u64, FileBuffer>,
-}
-
-impl Default for WriteBuffer {
-    fn default() -> Self {
-        Self::new()
-    }
+    spool_dir: PathBuf,
 }
 
 impl WriteBuffer {
-    pub fn new() -> Self {
+    /// `spool_dir` is where every buffer's backing file lives; resolve it with
+    /// [`crate::spool::spool_dir_from_env`] and prepare it before calling this.
+    pub fn new(spool_dir: PathBuf) -> Self {
         Self {
             buffers: HashMap::new(),
+            spool_dir,
         }
     }
 
@@ -106,7 +108,7 @@ impl WriteBuffer {
         match self.buffers.entry(fh) {
             Entry::Occupied(e) => Ok(e.into_mut()),
             Entry::Vacant(e) => {
-                let fb = FileBuffer::new(inode, original_size)?;
+                let fb = FileBuffer::new(inode, original_size, &self.spool_dir)?;
                 Ok(e.insert(fb))
             }
         }
@@ -154,16 +156,22 @@ impl WriteBuffer {
 mod tests {
     use super::*;
 
+    /// The buffers are unlinked temp files, so the system temp dir is fine for
+    /// tests; production resolves a disk-backed spool dir instead.
+    fn new_write_buffer() -> WriteBuffer {
+        WriteBuffer::new(std::env::temp_dir())
+    }
+
     #[test]
     fn test_new_buffer_empty() {
-        let wb = WriteBuffer::new();
+        let wb = new_write_buffer();
         assert!(!wb.is_open(1));
         assert!(wb.size(1).is_none());
     }
 
     #[test]
     fn test_open_creates_buffer() {
-        let mut wb = WriteBuffer::new();
+        let mut wb = new_write_buffer();
         wb.open(1, 100, 0).unwrap();
         assert!(wb.is_open(1));
         assert_eq!(wb.size(1), Some(0));
@@ -171,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_write_sequential() {
-        let mut wb = WriteBuffer::new();
+        let mut wb = new_write_buffer();
         wb.open(1, 100, 0).unwrap();
         wb.write(1, 0, b"hello").unwrap();
         wb.write(1, 5, b" world").unwrap();
@@ -182,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_write_at_offset() {
-        let mut wb = WriteBuffer::new();
+        let mut wb = new_write_buffer();
         wb.open(1, 100, 0).unwrap();
         wb.write(1, 5, b"abc").unwrap();
         assert_eq!(wb.size(1), Some(8));
@@ -192,7 +200,7 @@ mod tests {
 
     #[test]
     fn test_write_overwrite() {
-        let mut wb = WriteBuffer::new();
+        let mut wb = new_write_buffer();
         wb.open(1, 100, 0).unwrap();
         wb.write(1, 0, b"hello").unwrap();
         wb.write(1, 1, b"ELL").unwrap();
@@ -202,7 +210,7 @@ mod tests {
 
     #[test]
     fn test_read_back() {
-        let mut wb = WriteBuffer::new();
+        let mut wb = new_write_buffer();
         wb.open(1, 100, 0).unwrap();
         wb.write(1, 0, b"test data").unwrap();
         let data = wb.read(1, 5, 4).unwrap();
@@ -211,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_read_past_end() {
-        let mut wb = WriteBuffer::new();
+        let mut wb = new_write_buffer();
         wb.open(1, 100, 0).unwrap();
         wb.write(1, 0, b"short").unwrap();
         let data = wb.read(1, 3, 100).unwrap();
@@ -220,7 +228,7 @@ mod tests {
 
     #[test]
     fn test_read_empty() {
-        let mut wb = WriteBuffer::new();
+        let mut wb = new_write_buffer();
         wb.open(1, 100, 0).unwrap();
         let data = wb.read(1, 0, 10).unwrap();
         assert!(data.is_empty());
@@ -228,7 +236,7 @@ mod tests {
 
     #[test]
     fn test_flush_returns_data() {
-        let mut wb = WriteBuffer::new();
+        let mut wb = new_write_buffer();
         wb.open(1, 100, 0).unwrap();
         wb.write(1, 0, b"flush me").unwrap();
         let fb = wb.flush(1).unwrap();
@@ -242,7 +250,7 @@ mod tests {
 
     #[test]
     fn test_flush_removes_buffer() {
-        let mut wb = WriteBuffer::new();
+        let mut wb = new_write_buffer();
         wb.open(1, 100, 0).unwrap();
         wb.write(1, 0, b"data").unwrap();
         wb.flush(1);
@@ -251,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_dirty_tracking() {
-        let mut wb = WriteBuffer::new();
+        let mut wb = new_write_buffer();
         let fb = wb.open(1, 100, 0).unwrap();
         assert!(!fb.is_dirty());
         wb.write(1, 0, b"x").unwrap();
@@ -262,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_multiple_files() {
-        let mut wb = WriteBuffer::new();
+        let mut wb = new_write_buffer();
         wb.open(1, 100, 0).unwrap();
         wb.open(2, 200, 0).unwrap();
         wb.write(1, 0, b"file1").unwrap();
@@ -275,14 +283,14 @@ mod tests {
 
     #[test]
     fn test_write_nonexistent_fh() {
-        let mut wb = WriteBuffer::new();
+        let mut wb = new_write_buffer();
         let result = wb.write(999, 0, b"nope");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_large_write() {
-        let mut wb = WriteBuffer::new();
+        let mut wb = new_write_buffer();
         wb.open(1, 100, 0).unwrap();
         let big = vec![0xABu8; 2 * 1024 * 1024]; // 2 MB
         let written = wb.write(1, 0, &big).unwrap();
@@ -292,7 +300,7 @@ mod tests {
 
     #[test]
     fn test_sparse_write() {
-        let mut wb = WriteBuffer::new();
+        let mut wb = new_write_buffer();
         wb.open(1, 100, 0).unwrap();
         wb.write(1, 1000, b"sparse").unwrap();
         assert_eq!(wb.size(1), Some(1006));
