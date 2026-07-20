@@ -8,7 +8,8 @@ Mount MTP devices as local filesystems via FUSE, with _write_ support! This is p
 on [libmtp](https://github.com/libmtp/libmtp/).
 
 To use it, plug in your Android phone or camera, run `mtp-mount /mnt/phone`, and use `ls`, `cp`, `cat`, `rm`, `mv`
-on the device's storage like you would on any local directory.
+on the device's storage like you would on any local directory. Or run the `mtp-mountd` daemon and skip the mounting
+step: every device you plug in shows up under `$XDG_RUNTIME_DIR/mtp/` on its own.
 
 Built on [`mtp-rs`](https://crates.io/crates/mtp-rs) (pure-Rust MTP stack) and [
 `fuser`](https://crates.io/crates/fuser).
@@ -79,6 +80,49 @@ fighting a specific cable, and pick a window you'd be happy waiting out.
 
 MTP identifies files by session-scoped handles, so all of them go stale the moment the device reconnects. `mtp-mount`
 looks each one up again by path, keeping inode numbers unchanged, which is what lets already-open files carry on.
+
+## Mount devices automatically: `mtp-mountd`
+
+Running `mtp-mount` by hand, per device, is fine for a one-off copy. For a desktop that just works, there's a second
+binary: `mtp-mountd` watches for MTP devices and mounts each one as it's plugged in.
+
+```sh
+# Try it in a terminal first
+RUST_LOG=info mtp-mountd
+
+# Then leave it running as a user service
+mkdir -p ~/.config/systemd/user
+cp dist/mtp-mountd.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now mtp-mountd
+journalctl --user -fu mtp-mountd
+```
+
+Mounts appear under `$XDG_RUNTIME_DIR/mtp/`, one directory per device, named after the device's serial number:
+
+```
+/run/user/1000/mtp/2A31FDH200ABC/Internal shared storage/DCIM/
+/run/user/1000/mtp/2A31FDH200ABC/SD card/
+```
+
+- **One mount per device**, with each storage (internal memory, SD card) as a subdirectory. One phone is one place to
+  look, and one thing to clean up if anything goes wrong.
+- **Devices that report no serial number** get `usb-<vendor>-<product>-<port>` instead. That name lasts as long as the
+  device stays in the same port; without a serial there's nothing else that survives a replug.
+- **Unplug a device and its mount goes away immediately**, forcibly, even mid-copy. A FUSE mount whose device is gone
+  wedges anything that walks it, so leaving one behind is worse than never mounting.
+- **Stopping the service unmounts everything.** `systemctl --user stop mtp-mountd` leaves nothing behind. If a previous
+  daemon was killed outright and did leave mounts, the next one clears them at startup.
+- **No reconnect window.** A device that drops off is unmounted, and hotplug mounts it again when it comes back, which
+  beats freezing every process on the mount point while waiting.
+- `--mount-root PATH` moves the mounts, `--spool-dir PATH` moves the spool, `-r` mounts everything read-only. Run
+  `mtp-mountd --help` for the rest.
+
+If `$XDG_RUNTIME_DIR` isn't set (an SSH login without a logind session, a container), mounts go under
+`$XDG_CACHE_HOME/mtp-mount/mounts` instead, or `~/.cache/mtp-mount/mounts`. Never `/tmp`, which other users can write to.
+
+Running gvfs at the same time? It grabs the USB interface first and `mtp-mountd` then can't open the device. Stop it
+grabbing devices with `systemctl --user mask gvfs-mtp-volume-monitor`.
 
 ## What works
 
@@ -175,9 +219,10 @@ Integration tests mount a virtual MTP device via FUSE (Linux only, needs `libfus
 
 ```sh
 cargo test --test integration -- --ignored --test-threads=1
+cargo test --test daemon -- --ignored --test-threads=1
 ```
 
-99 tests total (72 unit + 27 integration), all passing on Linux. The integration tests use `mtp-rs`'s virtual device
+128 tests total (93 unit, 27 integration, 8 daemon), all passing on Linux. They use `mtp-rs`'s virtual device
 transport, so CI runs without any physical hardware.
 
 ## License

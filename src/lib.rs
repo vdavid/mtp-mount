@@ -1,4 +1,5 @@
 pub mod buffer;
+pub mod daemon;
 pub mod device;
 pub mod error;
 pub mod fs;

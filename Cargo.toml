@@ -19,10 +19,21 @@ exclude = [
     "rustfmt.toml",
 ]
 
+# Both binaries share the library in `src/lib.rs`: the CLI mounts one device on
+# request, the daemon mounts every device it sees. Declared explicitly so the
+# two names are visible here rather than inferred from the file layout.
+[[bin]]
+name = "mtp-mount"
+path = "src/main.rs"
+
+[[bin]]
+name = "mtp-mountd"
+path = "src/bin/mtp-mountd.rs"
+
 [dependencies]
-mtp-rs = { version = "0.26.0", features = ["virtual-device"] }
+mtp-rs = { version = "0.27.0", features = ["virtual-device"] }
 fuser = "0.17"
-tokio = { version = "1.51", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.51", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 clap = { version = "4.6", features = ["derive"] }
 thiserror = "2"
 log = "0.4"

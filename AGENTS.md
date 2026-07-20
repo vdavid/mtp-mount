@@ -2,6 +2,8 @@
 
 FUSE filesystem that mounts MTP devices (Android phones, cameras) as local directories. Built on `mtp-rs` for device communication and `fuser` for the FUSE layer. Translates POSIX filesystem calls into MTP operations.
 
+Two binaries over one library: `mtp-mount` mounts one device where a person asked, `mtp-mountd` is a daemon that mounts every device as it's plugged in. Same `MtpFs` underneath.
+
 ## Quick commands
 
 | Command                              | Description                             |
@@ -11,12 +13,14 @@ FUSE filesystem that mounts MTP devices (Android phones, cameras) as local direc
 | `just check-all`                     | Include security audit and license check|
 | `cargo run -- /mnt/phone`            | Mount first available device            |
 | `cargo run -- --list`                | List connected MTP devices              |
+| `cargo run --bin mtp-mountd`         | Run the auto-mounting daemon            |
 
 ## Project structure
 
 ```
 src/
-  main.rs          # CLI entry point (clap)
+  main.rs          # CLI entry point (clap), the `mtp-mount` binary
+  bin/mtp-mountd.rs# Daemon entry point: paths, USB watch, signals, then Supervisor::run
   lib.rs           # Module re-exports for integration tests
   fs.rs            # MtpFs: implements fuser::Filesystem
   inode.rs         # Inode table: maps FUSE inodes <-> MTP object handles
@@ -26,10 +30,18 @@ src/
   shutdown.rs      # One-way "take this mount down" signal
   hints.rs         # Remedies for device-open failures, shared with --help
   spool.rs         # Resolves and prepares the disk-backed spool directory
+  daemon/          # The mtp-mountd half (see "The daemon" below)
+    supervisor.rs  # The mount-owning loop, driven by a Command channel (the test seam)
+    usb.rs         # Production wiring: mtp-rs hotplug stream -> Commands
+    paths.rs       # Mount root resolution, device directory naming
+    unmount.rs     # Forced unmount, mountpoint detection, stale-mount sweep
   sparse_cache.rs  # Byte-range cache for on-demand partial reads
   error.rs         # MountError enum
 tests/
   integration.rs   # FUSE mount tests against mtp-rs virtual device
+  daemon.rs        # Daemon supervisor tests: synthetic hotplug -> real FUSE mounts
+dist/
+  mtp-mountd.service # systemd --user unit
 ```
 
 ## Architecture
@@ -77,16 +89,93 @@ Storage IDs are re-mapped eagerly instead (there are only a few): `adopt()` matc
 
 **Giving up.** `give_up()` prints why and raises the `Shutdown` signal. It can't unmount itself: a FUSE callback holds the inode lock and still owes the kernel a reply, and `fuser` hands the unmount handle to whoever mounted the filesystem. So `main` (and the test harness) watch the signal and call `umount_and_join`. That's also why `main` uses `spawn_mount2` rather than `mount2`: `Session::run` is `pub(crate)`, so the only way to keep a thread free for the watch loop is the background session.
 
+## The daemon (`mtp-mountd`)
+
+```
+mtp::watch_devices()  (mtp-rs, USB hotplug)
+  |  daemon::usb::spawn_hotplug_watch  (tokio task)
+  v
+Sender<Command> ------------------> Supervisor::run(Receiver<Command>)   <-- SEAM
+  ^                                   |            |
+  |                                   |            +-- unmount: force_unmount + verify + rmdir
+signal handler (SIGTERM/SIGINT)       +-- mount: DeviceSource -> DeviceOpener -> MtpFs -> spawn_mount2
+give-up watcher threads (one per mount, one per Shutdown signal)
+```
+
+**The seam is the command channel, and it's the whole reason this is testable.** USB hotplug can't be simulated: no
+container can be made to believe a phone was plugged in. So `Supervisor` never calls `watch_devices()`. Its entire input
+is `Receiver<Command>` (`Device(Arrived|Left)`, `GiveUp`, `Stop`), and `daemon::usb` is the only thing that knows about
+USB. A test sends an `Arrived` and gets a real FUSE mount over a real `mtp-rs` virtual device at a real path;
+everything below the channel is the production path. The second seam is `DeviceSource`, which hands back a
+`DeviceOpener`: production returns `UsbOpener` (matched on serial), tests return one that opens a virtual device.
+Don't move USB code into the supervisor, and don't let tests reach past the channel.
+
+**Threading.** `Supervisor::run` blocks its thread and must NOT run inside the tokio runtime: opening a device and
+mounting bridge async to sync with `Handle::block_on`, which panics on a runtime thread. `main` runs it on the main
+thread; the runtime carries the hotplug watch and the signal handler.
+
+**Mount paths.** `$XDG_RUNTIME_DIR/mtp/<key>/`, where `<key>` is the sanitized serial number, or
+`usb-<vid>-<pid>-<location>` when the device reports none. That one string is both the directory name AND the
+supervisor's identity for the device, so "already mounted?" and "where does it go?" can't disagree; it has to be
+derivable from what BOTH an arrival and a departure report, since a departure is all the supervisor gets to know which
+mount to take down. Two devices reporting the same serial therefore collide: the second is logged and ignored, not
+mounted over the first. Serials are device-controlled and become a path component, so `device_dir_name` sanitizes them
+(`../..` can't escape the root). No `$XDG_RUNTIME_DIR` falls back to the cache dir, never `/tmp` (world-writable).
+
+**Unmount is the correctness property, and it's forced by our own code.** Do NOT rely on `fuser`'s unmount: built
+against `libfuse3` (any distro with `libfuse3-dev`) it's a plain `umount()`, which returns `EBUSY` whenever anything
+holds the mount, and a busy mount is the normal case (the cable came out mid-copy). `daemon::unmount::force_unmount`
+does `umount2(MNT_DETACH)` on Linux / `unmount(MNT_FORCE)` on macOS, falling back to `fusermount3 -u -z` when the
+syscall is refused. The supervisor calls that FIRST, then hands `umount_and_join` to a side thread purely to reap the
+session (the join can block as long as the in-flight FUSE callback does, and the loop must not wait on it), then
+CHECKS with `wait_until_unmounted` before removing the directory. A test caught the EBUSY path; keep the check.
+
+**Stale mounts.** A daemon that was `SIGKILL`ed leaves mounts with nothing serving them: `stat()` on them fails with
+`ENOTCONN` and they wedge whatever walks them. `clean_stale_mounts` sweeps the mount root one level deep at startup.
+`is_mountpoint` treats both a differing `st_dev` and an `ENOTCONN` failure as "mounted", which is what makes the stale
+case detectable at all.
+
+**Reconnect is off (`ReconnectPolicy::from_secs(0)`) and must stay off.** The daemon has a better answer than waiting:
+a device that comes back arrives as a fresh hotplug event and is mounted again at the same path, with nothing frozen
+in between. Turning it on would trade a mount that reappears for a desktop that hangs (see "Surviving a disconnect").
+
+**Multiple storages**: one mount per device, storages as subdirectories. That's what `MtpFs` already does (each
+`Storage` is a directory under the mount root); the daemon adds nothing. Fewer mounts means less to leak.
+
+**Give-up watchers.** A mount raises its `Shutdown` signal from inside a FUSE callback and can't act on it, so each
+mount gets a thread that turns that signal into `Command::GiveUp`. This can beat the hotplug departure: the mount
+notices a dead session on its next operation, the USB watch only on its next poll.
+
 ## Testing
 
-- **Unit tests** (75): inode table, write buffer, sparse cache, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal. Run with `cargo test`.
+- **Unit tests** (93): inode table, write buffer, sparse cache, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal, mount-root resolution, device directory naming, mountpoint detection, stale-mount sweep. Run with `cargo test`.
 - **Integration tests** (27): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring, partial reads, and reconnects. Linux only (needs `libfuse3-dev`), except the one non-ignored test below. Run with `cargo test --test integration -- --ignored --test-threads=1`
+- **Daemon tests** (8, `tests/daemon.rs`): drive `Supervisor` through its command channel and assert against the real filesystem. Linux only, `cargo test --test daemon -- --ignored --test-threads=1`. See below.
 
 ### Testing a disconnect
 
 `mtp-rs` can't simulate one. `unregister_virtual_device` only removes a device from the *discovery* registry: an already-open `MtpDevice` keeps its transport and backing dir and answers as if nothing happened (pinned down by `test_unregistering_a_virtual_device_does_not_disconnect_an_open_one`, the one test in that file that isn't `#[ignore]`). So the seam is `device::UnplugSwitch`, an `Arc<AtomicBool>` the mount and the `DeviceOpener` share: while it's set, every MTP op fails `Disconnected` and reopening fails too. Production never flips it.
 
 The other trap is that the virtual device numbers handles from 1 in listing order, so a reopened device hands out the *same* handles and a mount that never re-resolved anything would still read the right bytes. The reconnect fixture defeats that with a decoy "Handle burner" storage: on every reopen the test's opener lists it first, burning 64 handles, so the real files come back with handles that can't collide with the dead session's. `test_open_fd_survives_reconnect` is the test that actually pins the re-resolution down (verified: it fails, reading zeros, if `bump_generation` is removed).
+
+### Testing the daemon
+
+`tests/daemon.rs` sends synthetic `Arrived`/`Left` commands and checks what actually happened on disk. Two things
+worth keeping:
+
+- **Proving a mount is gone** means the kernel's own record, not a dropped Rust value. `assert_really_unmounted` reads
+  `/proc/self/mountinfo`, re-`stat()`s the path, and requires the directory to be removable (`rmdir` on a live
+  mountpoint fails with `EBUSY`). An assertion that only checked a struct was dropped would pass over the `EBUSY`
+  unmount bug this suite found.
+- **A genuinely stale mount** needs a process that dies while mounted, so `startup_cleans_up_a_mount_a_killed_daemon_left_behind`
+  re-runs this same test binary as a child (`stale_mount_helper`, a `#[test]` that does nothing unless the parent set
+  `MTP_MOUNTD_TEST_STALE_*`), waits for it to mount, `SIGKILL`s it, and then sweeps. That's the only way to reach the
+  `ENOTCONN` branch in `is_mountpoint`.
+
+The virtual devices here set `watch_backing_dirs: false` and `event_poll_interval: ZERO`. With the watcher on, the
+mount's own writes land in the backing dir, the watcher re-keys object handles, and a write-then-read fails with a
+stale handle: real Android behavior, covered by the other suite, pure noise here.
+
 - All tests validated on Linux (Ubuntu, aarch64)
 
 ### Working on macOS without macFUSE
@@ -100,7 +189,9 @@ The other trap is that the virtual device numbers handles from 1 in listing orde
   docker run --rm --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
     -v "$PWD":/w -w /w -e CARGO_TARGET_DIR=/tmp/target rust:1-slim-bookworm \
     bash -c "apt-get update -qq && apt-get install -y -qq libfuse3-dev pkg-config fuse3 && \
-             cargo test --lib && cargo test --test integration -- --ignored --test-threads=1"
+             cargo test --lib && \
+             cargo test --test integration -- --ignored --test-threads=1 && \
+             cargo test --test daemon -- --ignored --test-threads=1"
   ```
 
   `CARGO_TARGET_DIR=/tmp/target` keeps the container's Linux artifacts out of the host `target/`.
@@ -109,7 +200,7 @@ The other trap is that the virtual device numbers handles from 1 in listing orde
 
 - **Minimal**: correct POSIX subset, not everything
 - **No data loss**: safe flush sequence protects against upload failures
-- **Well-tested**: 102 tests, virtual device integration, no hardware needed
+- **Well-tested**: 128 tests, virtual device integration, no hardware needed
 
 ## Things to avoid
 

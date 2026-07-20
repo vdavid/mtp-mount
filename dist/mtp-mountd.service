@@ -1,0 +1,24 @@
+[Unit]
+Description=Mount MTP devices automatically as they're plugged in
+Documentation=https://github.com/vdavid/mtp-mount
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/mtp-mountd
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=5
+
+# The daemon unmounts everything on SIGTERM. Give it room to do that before
+# systemd escalates to SIGKILL, which would leave the mounts behind.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Mounts appear under $XDG_RUNTIME_DIR/mtp, which systemd hands to user
+# services already. Nothing else here is namespaced: the daemon has to create
+# FUSE mounts the rest of the session can see, so PrivateTmp, ProtectHome, and
+# the mount-namespace hardening options would break exactly what it's for.
+NoNewPrivileges=false
+
+[Install]
+WantedBy=default.target

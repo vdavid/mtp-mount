@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`mtp-mountd`: plug in a phone and it's just there.** A second binary, meant to run as a `systemd --user` service, that watches for MTP devices and mounts each one as it arrives, under `$XDG_RUNTIME_DIR/mtp/<serial>/`. Unplug the device and the mount goes away immediately, forcibly, even mid-copy: a FUSE mount whose device is gone wedges every process that walks it, so leaving one behind is worse than never mounting. Several devices mount at once, a device with an SD card gets one mount with the storages as subdirectories, `SIGTERM` and `SIGINT` unmount everything, and mounts a killed daemon left behind are cleared at startup. Ships `dist/mtp-mountd.service`. Closes the manual, one-device-at-a-time gap that made mtp-mount unusable as a desktop's MTP layer ([#1](https://github.com/vdavid/mtp-mount/issues/1)).
 - **A cable glitch no longer has to kill the mount** (opt in with `--reconnect-timeout`). When the device disconnects, `mtp-mount` keeps the mount alive and reopens the same device (matched on serial number) as soon as it's back, then carries on: open file descriptors keep reading, cached read data stays, and a write that was still spooling is uploaded once the device returns. Filesystem calls block while the reconnect is in flight instead of failing, and never longer than the window.
 - **`--reconnect-timeout <SECONDS>`** sets how long to wait for a device that went away. **Off by default** (`0`): the first disconnect unmounts right away. Waiting is opt-in because it blocks rather than fails, so on a device that's genuinely gone every process touching the mount point, a file manager or a backup job included, freezes for the whole window. When the window runs out, `mtp-mount` says so and unmounts, instead of leaving a mount that answers every call with `EIO`.
 
@@ -19,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Updated to mtp-rs 0.27.0** (from 0.26.0) for `mtp::watch_devices()`, the USB hotplug stream `mtp-mountd` is built on.
 - Uploading on `close()` now reports failures: `close()` returns `EIO` when the flush didn't reach the device, instead of silently succeeding while only the log knew.
 
 - **Big writes no longer risk an out-of-memory stop.** Write buffers and read caches spooled to `$TMPDIR`, which is a tmpfs (RAM) on most current Linux distros, so `cp bigvideo.mp4 /mnt/phone/` tried to hold the whole file in memory. They now spool to a disk-backed per-user directory: `$XDG_CACHE_HOME/mtp-mount/spool` (falling back to `~/.cache/mtp-mount/spool`) on Linux, `~/Library/Caches/mtp-mount/spool` on macOS. The files stay unlinked, so their space comes back on its own after a crash.
