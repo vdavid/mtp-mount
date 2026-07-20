@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Actionable errors when another process holds the device.** A failed open now says what to do: `gio mount -l` and `systemctl --user mask gvfs-mtp-volume-monitor` for gvfs on Linux and `ptpcamerad` on macOS when the interface is busy, or the udev-rule fix when the OS denies permission. The remedies are shared with the `--help` troubleshooting section, so the two can't drift apart.
+
 ### Changed
 
 - **Updated to mtp-rs 0.26.0** (from 0.13.1), picking up 12 releases of device fixes: a 32-bit `GetPartialObject` fallback so PTP cameras that lack the 64-bit op can be read, in-session desync self-healing (an abandoned listing no longer kills the session), USB device reset recovery for wedged Samsung devices, and lenient datetime parsing for cameras that report a null date.

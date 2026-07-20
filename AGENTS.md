@@ -21,6 +21,7 @@ src/
   fs.rs            # MtpFs: implements fuser::Filesystem
   inode.rs         # Inode table: maps FUSE inodes <-> MTP object handles
   buffer.rs        # Write buffer: temp-file-backed, flushes to MTP on close
+  hints.rs         # Remedies for device-open failures, shared with --help
   sparse_cache.rs  # Byte-range cache for on-demand partial reads
   error.rs         # MountError enum
 tests/
@@ -51,7 +52,7 @@ mtp-rs (MtpDevice, Storage + next_event)
 
 ## Testing
 
-- **Unit tests** (44): inode table, write buffer, sparse cache. Run with `cargo test`.
+- **Unit tests** (48): inode table, write buffer, sparse cache, device-open hints. Run with `cargo test`.
 - **Integration tests** (21): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring and partial reads. Linux only (needs `libfuse3-dev`). Run with `cargo test --test integration -- --ignored --test-threads=1`
 - All tests validated on Linux (Ubuntu, aarch64)
 
@@ -75,13 +76,17 @@ mtp-rs (MtpDevice, Storage + next_event)
 
 - **Minimal**: correct POSIX subset, not everything
 - **No data loss**: safe flush sequence protects against upload failures
-- **Well-tested**: 63 tests, virtual device integration, no hardware needed
+- **Well-tested**: 69 tests, virtual device integration, no hardware needed
 
 ## Things to avoid
 
 - Complex caching strategies
 - Extended attributes, ACLs, or permission mapping
 - Hardlinks, symlinks (MTP doesn't support them)
+
+## Device-open failures
+
+`hints.rs` maps a failed open to a remedy: `mtp_rs::Error::is_exclusive_access()` (gvfs on Linux, `ptpcamerad` on macOS holds the interface) and `is_permission_denied()` (missing udev rule) each get a hint; anything else prints the bare error. `main.rs` prints the hint under the error, and `long_help()` embeds the same `BUSY_HINT`/`PERMISSION_HINT` consts (via `hints::indent`) into the `--help` troubleshooting section, so the two wordings can't drift. Add new remedies as consts there, not inline in either place.
 
 ## CLI and --help
 

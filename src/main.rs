@@ -1,12 +1,14 @@
 mod buffer;
 mod error;
 mod fs;
+mod hints;
 mod inode;
 mod sparse_cache;
 
 use clap::Parser;
 
 use crate::fs::MtpFs;
+use crate::hints::{indent, open_failure_hint, BUSY_HINT, PERMISSION_HINT};
 
 /// Mount MTP devices as local filesystems via FUSE.
 ///
@@ -16,7 +18,36 @@ use crate::fs::MtpFs;
 #[command(
     version,
     about,
-    after_long_help = "\
+    after_long_help = long_help()
+)]
+struct Cli {
+    /// Where to mount (the directory must already exist)
+    mountpoint: Option<String>,
+
+    /// Device serial number (connects to the first available device if omitted)
+    #[arg(short, long, value_name = "SERIAL")]
+    device: Option<String>,
+
+    /// Run in foreground instead of daemonizing
+    #[arg(short, long, default_value_t = true)]
+    foreground: bool,
+
+    /// Mount as read-only (no writes, deletes, or renames)
+    #[arg(short, long)]
+    read_only: bool,
+
+    /// List connected MTP devices and exit
+    #[arg(short, long)]
+    list: bool,
+}
+
+/// The hand-written `--help` sections.
+///
+/// The troubleshooting remedies come from [`crate::hints`], the same text the
+/// device-open failure prints, so the two can't drift apart.
+fn long_help() -> String {
+    format!(
+        "\
 EXAMPLES:
     Mount the first available device:
         mtp-mount /mnt/phone
@@ -42,36 +73,17 @@ TROUBLESHOOTING:
         (not \"Charging only\"), and the USB debugging prompt is accepted.
 
     \"interface is busy\"
-        Another program already claimed the USB interface. On Linux, check
-        if gvfs-mtp auto-mounted it: `gio mount -l` and unmount first.
+{busy}
 
     \"Permission denied\" on /dev/bus/usb
-        Add yourself to the `plugdev` group, or set up a udev rule.
-        See: https://github.com/vdavid/mtp-mount#requirements
+{permission}
 
 NOTES:
     Files are uploaded to the device when you close them, not on each write.
-    MTP doesn't support partial writes, hardlinks, symlinks, or chmod."
-)]
-struct Cli {
-    /// Where to mount (the directory must already exist)
-    mountpoint: Option<String>,
-
-    /// Device serial number (connects to the first available device if omitted)
-    #[arg(short, long, value_name = "SERIAL")]
-    device: Option<String>,
-
-    /// Run in foreground instead of daemonizing
-    #[arg(short, long, default_value_t = true)]
-    foreground: bool,
-
-    /// Mount as read-only (no writes, deletes, or renames)
-    #[arg(short, long)]
-    read_only: bool,
-
-    /// List connected MTP devices and exit
-    #[arg(short, long)]
-    list: bool,
+    MTP doesn't support partial writes, hardlinks, symlinks, or chmod.",
+        busy = indent(BUSY_HINT, "        "),
+        permission = indent(PERMISSION_HINT, "        "),
+    )
 }
 
 fn list_devices() {
@@ -139,6 +151,10 @@ fn main() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("Failed to open MTP device: {e}");
+            if let Some(hint) = open_failure_hint(&e) {
+                eprintln!();
+                eprintln!("{hint}");
+            }
             std::process::exit(1);
         }
     };
