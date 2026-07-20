@@ -42,7 +42,7 @@ mtp-rs (MtpDevice, Storage + next_event)
 **Entry point:** `main.rs` parses CLI args, opens the MTP device via `mtp-rs`, and starts the FUSE session via `fuser`.
 
 **Key design choices:**
-- **Reads** are byte-range on-demand via `download_partial_64`. Each open file handle has a `SparseCache` (tempfile + sorted `Vec<Range<u64>>` of populated ranges). FUSE `read(offset, size)` asks the cache for missing ranges, fetches them in 1 MB chunks, writes them into the tempfile, and serves the requested slice. No full-file download on open; supports files > 4 GB.
+- **Reads** are byte-range on-demand via `Storage::read_range`. Each open file handle has a `SparseCache` (tempfile + sorted `Vec<Range<u64>>` of populated ranges). FUSE `read(offset, size)` asks the cache for missing ranges, fetches them in 1 MB chunks, writes them into the tempfile, and serves the requested slice. No full-file download on open; supports files > 4 GB.
 - **Writes** buffer to a temp file (`tempfile::tempfile()`), flushed to MTP on `release`.
 - **Overwrites** use upload-then-delete-then-rename when the device supports rename. Falls back to delete-then-upload otherwise (with a warning log).
 - **Async bridge:** fuser callbacks are sync, mtp-rs is async. Uses `tokio::runtime::Handle::block_on()` to bridge.
@@ -51,9 +51,25 @@ mtp-rs (MtpDevice, Storage + next_event)
 
 ## Testing
 
-- **Unit tests** (42): inode table, write buffer, sparse cache. Run with `cargo test`.
+- **Unit tests** (44): inode table, write buffer, sparse cache. Run with `cargo test`.
 - **Integration tests** (21): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring and partial reads. Linux only (needs `libfuse3-dev`). Run with `cargo test --test integration -- --ignored --test-threads=1`
 - All tests validated on Linux (Ubuntu, aarch64)
+
+### Working on macOS without macFUSE
+
+`fuser`'s build script hard-fails on macOS when `pkg-config` can't find macFUSE, so a plain `cargo check` won't even compile. Two ways around it, no macFUSE install needed:
+
+- **Type-check and unit-test**: `cargo check --all-targets --features fuser/macos-no-mount` (same for `cargo clippy` and `cargo test --lib`). This compiles the FUSE layer without the mount syscalls, so it catches every API break; it just can't mount.
+- **Run the real integration tests**: use a Linux container, which is also the only place FUSE mounts work here.
+
+  ```bash
+  docker run --rm --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
+    -v "$PWD":/w -w /w -e CARGO_TARGET_DIR=/tmp/target rust:1-slim-bookworm \
+    bash -c "apt-get update -qq && apt-get install -y -qq libfuse3-dev pkg-config fuse3 && \
+             cargo test --lib && cargo test --test integration -- --ignored --test-threads=1"
+  ```
+
+  `CARGO_TARGET_DIR=/tmp/target` keeps the container's Linux artifacts out of the host `target/`.
 
 ## Design principles
 

@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Updated to mtp-rs 0.25.0** (from 0.13.1), picking up 12 releases of device fixes: a 32-bit `GetPartialObject` fallback so PTP cameras that lack the 64-bit op can be read, in-session desync self-healing (an abandoned listing no longer kills the session), USB device reset recovery for wedged Samsung devices, and lenient datetime parsing for cameras that report a null date.
+- Reads now call `Storage::read_range`, which replaced `download_partial_64` in mtp-rs 0.23. Same 64-bit partial-read op, same behavior, plus the camera fallback above.
+- `StorageInfo` field renames from mtp-rs 0.23 (`max_capacity` → `total_capacity`, `free_space_bytes` → `free_space`) applied to the `statfs` handler.
+
+### Added
+
+- Renovate config (`renovate.json`), so dependency updates land as grouped weekly PRs and mtp-rs bumps land immediately.
+
 ## [0.3.1] - 2026-04-17
 
 ### Fixed

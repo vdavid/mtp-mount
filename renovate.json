@@ -1,0 +1,48 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "schedule": ["before 6am on monday"],
+  "timezone": "Europe/Budapest",
+  "automerge": true,
+  "platformAutomerge": true,
+  "minimumReleaseAge": "3 days",
+  "packageRules": [
+    {
+      "description": "Group all non-major updates into one weekly PR",
+      "groupName": "all non-major updates",
+      "matchUpdateTypes": ["patch", "minor", "pin", "digest"],
+      "automerge": true
+    },
+    {
+      "description": "Group all major updates into one monthly PR",
+      "groupName": "all major updates",
+      "matchUpdateTypes": ["major"],
+      "schedule": ["before 6am on the first day of the month"],
+      "automerge": false
+    },
+    {
+      "description": "Security patches get immediate PRs, auto-merge",
+      "matchCategories": ["security"],
+      "schedule": ["at any time"],
+      "automerge": true,
+      "groupName": null
+    },
+    {
+      "description": "First-party crate (David's own). The 3-day pre-release gate exists to dodge other people's 0-days; bypass it so mtp-mount picks up mtp-rs device fixes immediately. mtp-rs is 0.x, so its minor bumps are breaking: these PRs need CI to be green, not just to build.",
+      "matchPackageNames": ["mtp-rs"],
+      "minimumReleaseAge": "0 days",
+      "schedule": ["at any time"],
+      "automerge": true,
+      "groupName": null
+    }
+  ],
+  "cargo": {
+    "enabled": true
+  },
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "schedule": ["at any time"],
+    "automerge": true,
+    "minimumReleaseAge": "3 days"
+  }
+}

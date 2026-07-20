@@ -65,6 +65,10 @@ impl TestMount {
                 read_only: false,
             }],
             supports_rename: true,
+            // Reads go through `Storage::read_range`, so the device must offer a
+            // partial-read op. `true` picks `GetPartialObject64`, matching the
+            // Android phones this is aimed at.
+            supports_partial_object_64: true,
             event_poll_interval: if watch_events {
                 Duration::from_millis(50)
             } else {

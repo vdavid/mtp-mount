@@ -759,8 +759,8 @@ impl Filesystem for MtpFs {
             cache.missing_ranges(offset, size as u64)
         };
 
-        // Fetch missing ranges. Uses the 64-bit partial-read op to support
-        // offsets beyond 4 GB. Each USB transfer is capped at 1 MB to keep
+        // Fetch missing ranges. `read_range` uses the 64-bit partial-read op to
+        // support offsets beyond 4 GB. Each USB transfer is capped at 1 MB to keep
         // latency reasonable.
         const CHUNK: u64 = 1024 * 1024;
         for range in missing {
@@ -768,12 +768,13 @@ impl Filesystem for MtpFs {
             while cursor < range.end {
                 let chunk_size = (range.end - cursor).min(CHUNK) as u32;
                 self.fetch_counter.fetch_add(1, Ordering::Relaxed);
-                let bytes = match self.rt.block_on(
-                    inner.storages[storage_idx].download_partial_64(handle, cursor, chunk_size),
-                ) {
+                let bytes = match self
+                    .rt
+                    .block_on(inner.storages[storage_idx].read_range(handle, cursor, chunk_size))
+                {
                     Ok(b) => b,
                     Err(e) => {
-                        error!("MTP download_partial_64 failed at offset {cursor}: {e}");
+                        error!("MTP read_range failed at offset {cursor}: {e}");
                         reply.error(Errno::EIO);
                         return;
                     }
@@ -1287,8 +1288,8 @@ impl Filesystem for MtpFs {
         let mut total_bytes: u64 = 0;
         let mut free_bytes: u64 = 0;
         for storage in &inner.storages {
-            total_bytes = total_bytes.saturating_add(storage.info().max_capacity);
-            free_bytes = free_bytes.saturating_add(storage.info().free_space_bytes);
+            total_bytes = total_bytes.saturating_add(storage.info().total_capacity);
+            free_bytes = free_bytes.saturating_add(storage.info().free_space);
         }
 
         let blocks = total_bytes / block_size;
