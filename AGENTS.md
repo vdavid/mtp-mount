@@ -33,6 +33,7 @@ src/
   daemon/          # The mtp-mountd half (see "The daemon" below)
     supervisor.rs  # The mount-owning loop, driven by a Command channel (the test seam)
     usb.rs         # Production wiring: mtp-rs hotplug stream -> Commands
+    dryrun.rs      # --dry-run: report what would be mounted, mount nothing
     paths.rs       # Mount root resolution, device directory naming
     unmount.rs     # Forced unmount, mountpoint detection, stale-mount sweep
   sparse_cache.rs  # Byte-range cache for on-demand partial reads
@@ -40,6 +41,7 @@ src/
 tests/
   integration.rs   # FUSE mount tests against mtp-rs virtual device
   daemon.rs        # Daemon supervisor tests: synthetic hotplug -> real FUSE mounts
+  dry_run.rs       # --dry-run reporting: key matching, verdict wording, touches-nothing
 dist/
   mtp-mountd.service # systemd --user unit
 ```
@@ -167,6 +169,22 @@ case detectable at all.
 a device that comes back arrives as a fresh hotplug event and is mounted again at the same path, with nothing frozen
 in between. Turning it on would trade a mount that reappears for a desktop that hangs (see "Surviving a disconnect").
 
+**`--dry-run` is how the hotplug path gets checked at all** (`daemon/dryrun.rs`). Nothing below `spawn_hotplug_watch`
+can be tested: USB can't be simulated, so `ident_of` never meets a real `MtpDeviceInfo` in CI. The silent failure that
+hides there is the mount key: derive it differently for an arrival and its departure and every departure matches
+nothing, so the daemon leaks mount points for as long as it runs. `--dry-run` watches real hotplug and prints the raw
+fields, the derived key, the path it would mount at, and, on each departure, whether the key MATCHES the arrival, plus
+a running tally and a closing summary. It creates nothing: no mount, no mount root, no mount point, no stale sweep, and
+the device is never opened, so it works on a machine with no FUSE (which is the point on macOS).
+
+Two things keep it honest. First, `usb::ident_of` goes *through* `DeviceFacts::ident()`, so the dry run reports the key
+a real mount would use rather than a second derivation that could agree in a test and disagree on a cable. Second, the
+reporter has the supervisor's shape: its whole input is a channel of `DryRunCommand`s, `usb::spawn_dry_run_watch` is
+the only USB-aware part, and `tests/dry_run.rs` injects synthetic arrivals and departures. The commands carry
+`DeviceFacts` rather than `DeviceIdent` because a dry run has to show its evidence, and because `MtpDeviceInfo` is
+`#[non_exhaustive]`: nothing outside `mtp-rs` can build one, so `DeviceFacts` is what makes a real device's fields
+testable data at all.
+
 **Multiple storages**: one mount per device, storages as subdirectories. That's what `MtpFs` already does (each
 `Storage` is a directory under the mount root); the daemon adds nothing. Fewer mounts means less to leak.
 
@@ -176,9 +194,10 @@ notices a dead session on its next operation, the USB watch only on its next pol
 
 ## Testing
 
-- **Unit tests** (93): inode table, write buffer, sparse cache, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal, mount-root resolution, device directory naming, mountpoint detection, stale-mount sweep. Run with `cargo test`.
-- **Integration tests** (29): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring, partial reads, and reconnects. Linux only (needs `libfuse3-dev`), except the one non-ignored test below. Run with `cargo test --test integration -- --ignored --test-threads=1`
+- **Unit tests** (98): inode table, write buffer, sparse cache, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal, mount-root resolution, device directory naming, mountpoint detection, stale-mount sweep, dry-run key derivation. Run with `cargo test`.
+- **Integration tests** (29): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring, partial reads, reconnects, and re-keyed handles. Linux only (needs `libfuse3-dev`), except the one non-ignored test below. Run with `cargo test --test integration -- --ignored --test-threads=1`
 - **Daemon tests** (8, `tests/daemon.rs`): drive `Supervisor` through its command channel and assert against the real filesystem. Linux only, `cargo test --test daemon -- --ignored --test-threads=1`. See below.
+- **Dry-run tests** (7, `tests/dry_run.rs`): inject arrivals and departures into the `--dry-run` reporter and assert on the verdict, the wording a person reads, and that a run leaves a temp mount root untouched. No FUSE, no device, so they run everywhere with plain `cargo test`.
 
 ### Testing a disconnect
 
@@ -230,7 +249,7 @@ is gone (verified by reverting the fix, which fails that test with `EIO`).
 
 - **Minimal**: correct POSIX subset, not everything
 - **No data loss**: safe flush sequence protects against upload failures
-- **Well-tested**: 130 tests, virtual device integration, no hardware needed
+- **Well-tested**: 142 tests, virtual device integration, no hardware needed
 
 ## Things to avoid
 

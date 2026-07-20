@@ -12,9 +12,10 @@ use std::sync::Arc;
 use clap::Parser;
 use log::{error, info};
 
+use mtp_mount::daemon::dryrun::{DryRun, DryRunCommand};
 use mtp_mount::daemon::supervisor::{Command, Supervisor, SupervisorConfig};
 use mtp_mount::daemon::unmount::clean_stale_mounts;
-use mtp_mount::daemon::usb::{spawn_hotplug_watch, UsbSource};
+use mtp_mount::daemon::usb::{spawn_dry_run_watch, spawn_hotplug_watch, UsbSource};
 use mtp_mount::daemon::{mount_root_from_env, RUNTIME_SUBDIR};
 use mtp_mount::hints::{indent, BUSY_HINT, PERMISSION_HINT};
 use mtp_mount::spool;
@@ -38,6 +39,10 @@ struct Cli {
     /// Mount every device read-only (no writes, deletes, or renames)
     #[arg(short, long)]
     read_only: bool,
+
+    /// Report what would be mounted as devices come and go, and mount nothing
+    #[arg(long)]
+    dry_run: bool,
 }
 
 fn long_help() -> String {
@@ -64,6 +69,20 @@ RUNNING IT:
 
     In a terminal, to watch what it's doing:
         RUST_LOG=info mtp-mountd
+
+CHECKING A DEVICE WITHOUT MOUNTING IT (--dry-run):
+        mtp-mountd --dry-run
+
+    Watches for devices and prints what it WOULD do: the fields each device
+    reports, the mount key derived from them, and the path it would mount at.
+    Nothing is mounted, no directory is created, and the device is never
+    opened, so this works on a machine with no FUSE at all.
+
+    Plug the device in, wait for the PLUGGED IN block, then unplug it. The
+    UNPLUGGED block says whether its key MATCHES the arrival. It has to: the
+    key is how a departure finds the mount to take down, so a device whose
+    two keys disagree would leave its mount behind. Do that a few times and
+    read the summary. --spool-dir and -r do nothing in this mode.
 
 TROUBLESHOOTING:
     Nothing gets mounted
@@ -95,21 +114,29 @@ fn main() {
     env_logger::init();
     let cli = Cli::parse();
 
-    // Both directories are resolved before any USB work: a daemon that can't
-    // spool or can't make mount points should say so and exit, not claim a USB
-    // interface first and fail per-device afterwards.
-    let spool_dir = match spool::spool_dir_from_env(cli.spool_dir.as_deref())
-        .and_then(|dir| spool::prepare_spool_dir(&dir).map(|()| dir))
-    {
-        Ok(dir) => dir,
+    // Resolving the mount root touches nothing on disk, which is what lets a
+    // dry run report the path it would use and then stop before anything is
+    // created.
+    let mount_root = match mount_root_from_env(cli.mount_root.as_deref()) {
+        Ok(root) => root,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1);
         }
     };
 
-    let mount_root = match mount_root_from_env(cli.mount_root.as_deref()) {
-        Ok(root) => root,
+    if cli.dry_run {
+        run_dry_run(mount_root);
+        return;
+    }
+
+    // The spool is resolved before any USB work: a daemon that can't spool
+    // should say so and exit, not claim a USB interface first and fail
+    // per-device afterwards.
+    let spool_dir = match spool::spool_dir_from_env(cli.spool_dir.as_deref())
+        .and_then(|dir| spool::prepare_spool_dir(&dir).map(|()| dir))
+    {
+        Ok(dir) => dir,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1);
@@ -139,7 +166,12 @@ fn main() {
         eprintln!("Can't watch for USB devices: {e}");
         std::process::exit(1);
     }
-    spawn_signal_handler(&handle, commands.clone());
+    {
+        let commands = commands.clone();
+        spawn_signal_handler(&handle, move |signal| {
+            let _ = commands.send(Command::Stop(format!("got {signal}")));
+        });
+    }
 
     info!(
         "Watching for MTP devices; mounts appear under {}",
@@ -159,13 +191,46 @@ fn main() {
     info!("Stopped.");
 }
 
-/// Turn a stop signal into a [`Command::Stop`].
+/// Watch for devices and report what would be mounted, mounting nothing.
+///
+/// The hotplug path is the one part of the daemon that no test can exercise, so
+/// this is how it gets checked against a real device. It creates nothing: the
+/// mount root isn't made, the stale-mount sweep doesn't run (it unmounts
+/// things), and no device is opened. See [`mtp_mount::daemon::dryrun`].
+fn run_dry_run(mount_root: PathBuf) {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Can't start the async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    let handle = rt.handle().clone();
+
+    let (events, inbox) = mpsc::channel();
+    if let Err(e) = spawn_dry_run_watch(&handle, events.clone()) {
+        eprintln!("Can't watch for USB devices: {e}");
+        std::process::exit(1);
+    }
+    spawn_signal_handler(&handle, move |signal| {
+        let _ = events.send(DryRunCommand::Stop(format!("got {signal}")));
+    });
+
+    // On the main thread for the same reason `Supervisor::run` is: the runtime
+    // carries the watch and the signal handler.
+    DryRun::new(mount_root).run(inbox);
+}
+
+/// Turn a stop signal into whatever the caller wants to stop.
 ///
 /// `systemd` stops services with `SIGTERM`, and a person stops one in a
 /// terminal with `SIGINT`. Both have to unmount everything on the way out:
 /// mounts left behind after a `systemctl --user stop` are exactly the wedged
 /// directories this daemon exists to avoid.
-fn spawn_signal_handler(rt: &tokio::runtime::Handle, commands: mpsc::Sender<Command>) {
+fn spawn_signal_handler<F>(rt: &tokio::runtime::Handle, on_signal: F)
+where
+    F: FnOnce(&str) + Send + 'static,
+{
     rt.spawn(async move {
         use tokio::signal::unix::{signal, SignalKind};
 
@@ -188,6 +253,6 @@ fn spawn_signal_handler(rt: &tokio::runtime::Handle, commands: mpsc::Sender<Comm
             _ = terminate.recv() => "SIGTERM",
             _ = interrupt.recv() => "SIGINT",
         };
-        let _ = commands.send(Command::Stop(format!("got {signal_name}")));
+        on_signal(signal_name);
     });
 }

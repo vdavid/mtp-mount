@@ -118,6 +118,22 @@ Mounts appear under `$XDG_RUNTIME_DIR/mtp/`, one directory per device, named aft
 - `--mount-root PATH` moves the mounts, `--spool-dir PATH` moves the spool, `-r` mounts everything read-only. Run
   `mtp-mountd --help` for the rest.
 
+### Checking a device without mounting it: `--dry-run`
+
+```sh
+mtp-mountd --dry-run
+```
+
+Watches for devices and prints what it *would* do, mounting nothing: the fields each device reports, the mount key
+derived from them, and the full path it would mount at. No directory is created and the device is never opened, so this
+runs anywhere, including a machine with no FUSE.
+
+It's there to answer one question about your device: plug it in, wait for the `PLUGGED IN` block, then unplug it, and
+the `UNPLUGGED` block says whether the key matches the arrival's. It has to, because that key is how a departure finds
+the mount to take down; a device whose two keys disagree would leave its mount behind every time. Do that a few times
+and read the summary at the end. If it says `PROBLEM`,
+[open an issue](https://github.com/vdavid/mtp-mount/issues) with the output: that's a device we need to know about.
+
 If `$XDG_RUNTIME_DIR` isn't set (an SSH login without a logind session, a container), mounts go under
 `$XDG_CACHE_HOME/mtp-mount/mounts` instead, or `~/.cache/mtp-mount/mounts`. Never `/tmp`, which other users can write to.
 

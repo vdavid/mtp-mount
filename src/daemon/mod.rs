@@ -14,15 +14,20 @@
 //!   those commands.
 //! - [`paths`]: where mounts live and what each one is called.
 //! - [`unmount`]: taking a mount down for good, and proving it's gone.
+//! - [`dryrun`]: `--dry-run`, which watches real devices and reports what would
+//!   happen without mounting anything. It's how the hotplug path, the one part
+//!   no test can reach, gets checked against a real phone.
 
+pub mod dryrun;
 pub mod paths;
 pub mod supervisor;
 pub mod unmount;
 pub mod usb;
 
+pub use dryrun::{DepartureVerdict, DeviceFacts, DryRun, DryRunCommand};
 pub use paths::{device_dir_name, mount_root_from_env, resolve_mount_root, RUNTIME_SUBDIR};
 pub use supervisor::{
     Command, DeviceChange, DeviceIdent, DeviceSource, Supervisor, SupervisorConfig,
 };
 pub use unmount::{clean_stale_mounts, force_unmount, is_mountpoint};
-pub use usb::{ident_of, spawn_hotplug_watch, UsbSource};
+pub use usb::{facts_of, ident_of, spawn_dry_run_watch, spawn_hotplug_watch, UsbSource};
