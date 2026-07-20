@@ -48,11 +48,14 @@ mtp-rs (MtpDevice, Storage + next_event)
 
 **Key design choices:**
 - **Reads** are byte-range on-demand via `Storage::read_range`. Each open file handle has a `SparseCache` (tempfile + sorted `Vec<Range<u64>>` of populated ranges). FUSE `read(offset, size)` asks the cache for missing ranges, fetches them in 1 MB chunks, writes them into the tempfile, and serves the requested slice. No full-file download on open; supports files > 4 GB.
-- **Writes** buffer to a temp file in the spool dir, flushed to MTP on `release`.
+- **Writes** buffer to a temp file in the spool dir, flushed to MTP on `release`. The flush hands `Storage::upload` a
+  lazy stream over the spool file (`fs::file_stream`, 64 KiB per chunk), so an upload holds one chunk in memory
+  regardless of file size. Don't collect those chunks into a `Vec` first: that puts the whole file back in RAM, which
+  is the bug the lazy stream exists to prevent.
 - **Spool directory**: both temp files (write buffers and sparse read caches) are created with `tempfile::tempfile_in(spool_dir)`, never plain `tempfile::tempfile()`. `$TMPDIR` is a tmpfs on most current Linux distros, so a whole-file write buffer there is RAM and a big `cp` OOMs. `spool.rs::resolve_spool_dir` is pure (env values in, path out) and picks `$XDG_CACHE_HOME/mtp-mount/spool` → `$HOME/.cache/mtp-mount/spool` on Linux, `$HOME/Library/Caches/mtp-mount/spool` on macOS; `--spool-dir` overrides. `main` resolves and prepares it *before* opening the device, and exits with the path named if it isn't writable. Never fall back to `$TMPDIR` on failure: that restores the OOM bug invisibly. The files stay **unlinked**, so a crash reclaims the space with no cleanup pass; don't switch them to named temp files.
 - **Overwrites** use upload-then-delete-then-rename when the device supports rename. Falls back to delete-then-upload otherwise (with a warning log).
 - **Async bridge:** fuser callbacks are sync, mtp-rs is async. Uses `tokio::runtime::Handle::block_on()` to bridge.
-- **Locking:** single `Arc<Mutex<Inner>>` serializes all FUSE callbacks. Shared with the event monitor task. Acceptable because fuser already serializes per-mount.
+- **Locking:** single `Arc<Mutex<Inner>>` serializes all FUSE callbacks. Shared with the event monitor task. Acceptable because fuser already serializes per-mount: `fuser::Config::default()` leaves `n_threads` at 1, so one event-loop thread dispatches every request and doesn't read the next one until the current callback returns. That's why dropping the lock around a long upload would buy nothing today; if you ever want concurrent callbacks, raise `n_threads` first (Linux only in fuser 0.17), and only then does the lock's scope matter.
 - **Event monitoring:** A background tokio task polls `MtpDevice::next_event()` on a cloned device handle (cheap, Arc-backed). On `ObjectAdded`/`ObjectRemoved`/`ObjectInfoChanged` events, it invalidates the relevant directory's cache entry in `dirs_loaded`. For unknown objects (newly added on device), it invalidates all directories. Each loop belongs to one session (`event_epoch`); a reconnect bumps the epoch and the old loop exits on its next tick.
 - **Reconnect:** the mount survives a device that disconnects and comes back. See "Surviving a disconnect" below.
 
@@ -76,7 +79,7 @@ Storage IDs are re-mapped eagerly instead (there are only a few): `adopt()` matc
 
 ## Testing
 
-- **Unit tests** (72): inode table, write buffer, sparse cache, spool-dir resolution, device-open hints, reconnect policy, shutdown signal. Run with `cargo test`.
+- **Unit tests** (75): inode table, write buffer, sparse cache, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal. Run with `cargo test`.
 - **Integration tests** (27): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring, partial reads, and reconnects. Linux only (needs `libfuse3-dev`), except the one non-ignored test below. Run with `cargo test --test integration -- --ignored --test-threads=1`
 
 ### Testing a disconnect
@@ -106,7 +109,7 @@ The other trap is that the virtual device numbers handles from 1 in listing orde
 
 - **Minimal**: correct POSIX subset, not everything
 - **No data loss**: safe flush sequence protects against upload failures
-- **Well-tested**: 77 tests, virtual device integration, no hardware needed
+- **Well-tested**: 102 tests, virtual device integration, no hardware needed
 
 ## Things to avoid
 

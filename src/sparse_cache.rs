@@ -31,6 +31,8 @@ impl SparseCache {
     /// return 0 bytes before the caller has fetched them.
     pub fn new(total_size: u64, spool_dir: &Path) -> io::Result<Self> {
         let file = tempfile::tempfile_in(spool_dir)?;
+        // Costs no disk until something is written into it, because the spool
+        // sits on a sparse-file filesystem (APFS, ext4, xfs, btrfs).
         file.set_len(total_size)?;
         Ok(Self {
             file,

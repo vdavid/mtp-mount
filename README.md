@@ -102,8 +102,9 @@ The FUSE layer translates filesystem calls into MTP operations:
 - **Reads are byte-range on-demand.** Each FUSE `read(offset, size)` fetches only the missing bytes via MTP's
   `GetPartialObject64`, writes them into a sparse tempfile, and serves the requested slice. Repeated reads of the same
   region hit the local cache. Scrubbing a 10 GB video only downloads what you actually touch.
-- **Writes spool to disk**, then flush to the device on close. The spool lives in your cache directory, not `/tmp`:
-  on most current Linux distros `/tmp` is a tmpfs (RAM), and a 4 GB upload buffered there would fill memory.
+- **Writes spool to disk**, then upload to the device on close. The spool lives in your cache directory, not `/tmp`:
+  on most current Linux distros `/tmp` is a tmpfs (RAM), and a 4 GB upload buffered there would fill memory. The upload
+  streams from the spool file in 64 KiB chunks, so memory stays flat no matter how big the file is.
 - **Overwrites use a safe upload-then-delete-then-rename sequence** when the device supports rename. So if the upload
   fails, the original is still there. Falls back to delete-then-upload with a warning log on devices that don't support
   rename.

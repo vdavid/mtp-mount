@@ -3,6 +3,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::io::{Seek, SeekFrom};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,6 +27,9 @@ use crate::shutdown::Shutdown;
 use crate::sparse_cache::SparseCache;
 
 const TTL: Duration = Duration::from_secs(1);
+
+/// How much of a spool file an upload holds in memory at a time.
+const UPLOAD_CHUNK: usize = 65536;
 
 /// How many times an operation is retried across reconnects before it gives up.
 /// One reconnect is the cable glitch we're here for; a second is a device that
@@ -127,27 +131,32 @@ fn bytes_stream(
     futures::stream::iter(chunks)
 }
 
-/// Read a file in 64KB chunks and return as a stream.
+/// Streams a spool file in [`UPLOAD_CHUNK`]-sized pieces, reading each one only
+/// when the consumer asks for it. That's what keeps an upload's memory flat: a
+/// 4 GB file costs one chunk of RAM, not 4 GB.
+///
+/// The read is a blocking `std::fs` read, which is fine because the only caller
+/// polls this from `Handle::block_on` on a FUSE callback thread that has nothing
+/// else to do. Don't spawn this stream onto the runtime: it would park a worker.
 fn file_stream(
-    mut file: std::fs::File,
-) -> futures::stream::Iter<std::vec::IntoIter<Result<Bytes, io::Error>>> {
+    file: std::fs::File,
+) -> Pin<Box<dyn futures::Stream<Item = Result<Bytes, io::Error>> + Send>> {
     use std::io::Read as _;
-    let mut chunks = Vec::new();
-    loop {
-        let mut buf = vec![0u8; 65536];
+    // The `Option` is the terminator. Handing the file back only after a
+    // successful read means EOF and errors both end the stream; a version that
+    // kept the file after an error would re-emit that same error forever.
+    Box::pin(futures::stream::unfold(Some(file), |state| async move {
+        let mut file = state?;
+        let mut buf = vec![0u8; UPLOAD_CHUNK];
         match file.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => None,
             Ok(n) => {
                 buf.truncate(n);
-                chunks.push(Ok(Bytes::from(buf)));
+                Some((Ok(Bytes::from(buf)), Some(file)))
             }
-            Err(e) => {
-                chunks.push(Err(e));
-                break;
-            }
+            Err(e) => Some((Err(e), None)),
         }
-    }
-    futures::stream::iter(chunks)
+    }))
 }
 
 /// Mutable state protected by `RefCell` so fuser's `&self` callbacks can mutate it.
@@ -1632,5 +1641,69 @@ impl Filesystem for MtpFs {
         reply: ReplyEmpty,
     ) {
         reply.ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt as _;
+    use std::io::Write as _;
+
+    const CHUNK: usize = UPLOAD_CHUNK;
+
+    /// A temp file holding `content`, rewound to the start.
+    fn spool_file(content: &[u8]) -> std::fs::File {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(content).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file
+    }
+
+    #[test]
+    fn file_stream_reads_lazily() {
+        let file = spool_file(&vec![0xABu8; CHUNK * 4]);
+        // `try_clone` dups the fd, so the clone shares the read cursor and shows
+        // how far the stream has actually read.
+        let mut cursor = file.try_clone().unwrap();
+
+        let mut stream = file_stream(file);
+        let first = futures::executor::block_on(stream.next()).unwrap().unwrap();
+
+        assert_eq!(first.len(), CHUNK);
+        assert_eq!(
+            cursor.stream_position().unwrap(),
+            CHUNK as u64,
+            "one poll must read one chunk, not the whole file"
+        );
+    }
+
+    #[test]
+    fn file_stream_yields_the_whole_file_then_ends() {
+        // Two full chunks plus a short tail, so the partial-read path is covered.
+        let content = vec![0xCDu8; CHUNK * 2 + 17];
+
+        let chunks: Vec<_> =
+            futures::executor::block_on(file_stream(spool_file(&content)).collect());
+
+        let sizes: Vec<_> = chunks.iter().map(|c| c.as_ref().unwrap().len()).collect();
+        assert_eq!(sizes, vec![CHUNK, CHUNK, 17]);
+        let joined: Vec<u8> = chunks
+            .into_iter()
+            .flat_map(|c| c.unwrap().to_vec())
+            .collect();
+        assert_eq!(joined, content);
+    }
+
+    #[test]
+    fn file_stream_ends_after_a_read_error() {
+        // A write-only fd fails every read with EBADF, and the stream has to stop
+        // there rather than re-emitting the error forever.
+        let path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+
+        let mut stream = file_stream(file);
+        assert!(futures::executor::block_on(stream.next()).unwrap().is_err());
+        assert!(futures::executor::block_on(stream.next()).is_none());
     }
 }

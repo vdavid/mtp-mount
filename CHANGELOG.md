@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Copying a big file to a device no longer fills RAM.** The flush on `close()` read the whole spool file into memory before sending it, so `cp bigvideo.mp4 /mnt/phone/` still peaked at the file's size in RSS even after the spool itself moved to disk. Uploads now stream from the spool in 64 KiB chunks, so memory stays flat whether the file is 4 MB or 40 GB.
 - **Re-listing a directory no longer changes its files' inode numbers.** Inodes are now reused for entries that are still there under the same name, so an `ls` in one terminal can't break a file another process has open.
 
 ### Changed
