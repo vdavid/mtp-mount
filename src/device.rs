@@ -99,6 +99,16 @@ impl UnplugSwitch {
 /// [`mtp_rs::Error::DeviceReset`] belongs here too: the device is still plugged
 /// in, but `mtp-rs` reset it in software to recover, so the session (and every
 /// handle in it) is dead and the cure is the same reopen.
+///
+/// **Don't replace this with `mtp_rs::Error::is_disconnected()`.** That
+/// predicate is `Disconnected` alone, deliberately excluding `DeviceReset`
+/// (there the device is still there, so a consumer that drops it from a sidebar
+/// would be throwing away a live device). A mount asks a different question:
+/// "does this session need a reopen?", and after a reset it does. Swapping in
+/// the narrower predicate would leave the mount answering every call with the
+/// dead session's handles. `NoDevice` is likewise ours to keep, so a device
+/// that's gone by the time we reopen still walks the reconnect path.
+/// Pinned by `link_loss_is_broader_than_mtp_rs_is_disconnected`.
 pub fn is_link_lost(error: &mtp_rs::Error) -> bool {
     matches!(
         error,
@@ -133,5 +143,20 @@ mod tests {
         assert!(!is_link_lost(&mtp_rs::Error::NotFound));
         assert!(!is_link_lost(&mtp_rs::Error::AccessDenied));
         assert!(!is_link_lost(&mtp_rs::Error::Timeout));
+    }
+
+    /// `mtp-rs`'s `is_disconnected()` answers "is the device gone?", which isn't
+    /// the question a mount asks. Ours is "does the session need a reopen?", and
+    /// a software reset needs one while the device is still plugged in. If this
+    /// ever stops failing on the `DeviceReset` line, the two questions have
+    /// converged and only then is swapping the predicates safe.
+    #[test]
+    fn link_loss_is_broader_than_mtp_rs_is_disconnected() {
+        assert!(mtp_rs::Error::Disconnected.is_disconnected());
+        assert!(!mtp_rs::Error::DeviceReset.is_disconnected());
+        assert!(!mtp_rs::Error::NoDevice.is_disconnected());
+
+        assert!(is_link_lost(&mtp_rs::Error::DeviceReset));
+        assert!(is_link_lost(&mtp_rs::Error::NoDevice));
     }
 }

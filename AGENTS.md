@@ -77,7 +77,7 @@ mtp-rs (MtpDevice, Storage + next_event)
 
 A flaky cable drops the device and brings it back. The mount stays up, reopens the same device, and resumes.
 
-**The flow.** Every MTP call goes through `MtpFs::with_recovery`, which runs a closure, and on a session-loss error (`device::is_link_lost`: `Disconnected`, `DeviceReset`, `NoDevice`) calls `reconnect()` and runs the closure again, up to `MAX_ATTEMPTS`. `reconnect()` sleeps through `ReconnectPolicy::schedule()` (capped exponential backoff, total exactly the window), asking the `DeviceOpener` for the device each time. Success goes to `adopt()`; running out of window calls `give_up()`.
+**The flow.** Every MTP call goes through `MtpFs::with_recovery`, which runs a closure, and on a session-loss error (`device::is_link_lost`: `Disconnected`, `DeviceReset`, `NoDevice`) calls `reconnect()` and runs the closure again, up to `MAX_ATTEMPTS`. `reconnect()` sleeps through `ReconnectPolicy::schedule()` (capped exponential backoff, total exactly the window), asking the `DeviceOpener` for the device each time. Success goes to `adopt()`; running out of window calls `give_up()`. `is_link_lost` is deliberately broader than `mtp_rs::Error::is_disconnected()`, which is `Disconnected` alone: a mount asks "does this session need a reopen?", and after a `DeviceReset` it does, so don't swap ours out for the upstream predicate.
 
 **Why the closure, not the call.** `with_recovery` re-runs the whole closure, and each closure re-resolves its own handles and storage index. A closure that captured a handle from the dead session would retry with a token the new session has never heard of.
 
@@ -194,7 +194,7 @@ notices a dead session on its next operation, the USB watch only on its next pol
 
 ## Testing
 
-- **Unit tests** (98): inode table, write buffer, sparse cache, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal, mount-root resolution, device directory naming, mountpoint detection, stale-mount sweep, dry-run key derivation. Run with `cargo test`.
+- **Unit tests** (99): inode table, write buffer, sparse cache, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal, mount-root resolution, device directory naming, mountpoint detection, stale-mount sweep, dry-run key derivation. Run with `cargo test`.
 - **Integration tests** (29): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring, partial reads, reconnects, and re-keyed handles. Linux only (needs `libfuse3-dev`), except the one non-ignored test below. Run with `cargo test --test integration -- --ignored --test-threads=1`
 - **Daemon tests** (8, `tests/daemon.rs`): drive `Supervisor` through its command channel and assert against the real filesystem. Linux only, `cargo test --test daemon -- --ignored --test-threads=1`. See below.
 - **Dry-run tests** (7, `tests/dry_run.rs`): inject arrivals and departures into the `--dry-run` reporter and assert on the verdict, the wording a person reads, and that a run leaves a temp mount root untouched. No FUSE, no device, so they run everywhere with plain `cargo test`.
@@ -249,7 +249,7 @@ is gone (verified by reverting the fix, which fails that test with `EIO`).
 
 - **Minimal**: correct POSIX subset, not everything
 - **No data loss**: safe flush sequence protects against upload failures
-- **Well-tested**: 142 tests, virtual device integration, no hardware needed
+- **Well-tested**: 143 tests, virtual device integration, no hardware needed
 
 ## Things to avoid
 
