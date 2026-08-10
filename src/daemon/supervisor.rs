@@ -253,7 +253,7 @@ impl Supervisor {
         let mut fuse_config = fuser::Config::default();
         fuse_config.mount_options = mtp_fs.mount_options();
 
-        let session = match fuser::spawn_mount2(mtp_fs, &path, &fuse_config) {
+        let session = match fuser::spawn_mount(mtp_fs, &path, &fuse_config) {
             Ok(session) => session,
             Err(e) => {
                 error!("Can't mount {} at {}: {e}", ident.label, path.display());

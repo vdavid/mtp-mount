@@ -224,7 +224,7 @@ impl TestMount {
         std::mem::forget(rt);
         std::mem::forget(burner_dir);
 
-        let session = fuser::spawn_mount2(mtp_fs, mount_point.path(), &fuse_config)
+        let session = fuser::spawn_mount(mtp_fs, mount_point.path(), &fuse_config)
             .expect("failed to mount FUSE filesystem");
         let session = Arc::new(Mutex::new(Some(session)));
 

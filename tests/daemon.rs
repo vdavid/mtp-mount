@@ -523,7 +523,7 @@ fn stale_mount_helper() {
     );
     let mut fuse_config = fuser::Config::default();
     fuse_config.mount_options = mtp_fs.mount_options();
-    let session = fuser::spawn_mount2(mtp_fs, &mountpoint, &fuse_config).expect("mount");
+    let session = fuser::spawn_mount(mtp_fs, &mountpoint, &fuse_config).expect("mount");
 
     // Never unmount: the parent kills this process, which is exactly how a
     // daemon leaves a mount behind.

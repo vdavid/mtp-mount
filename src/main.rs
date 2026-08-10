@@ -234,10 +234,10 @@ fn main() {
     let mut config = fuser::Config::default();
     config.mount_options = mount_options;
 
-    // The session runs on its own thread rather than through `fuser::mount2`,
+    // The session runs on its own thread rather than through `fuser::mount`,
     // so this thread can unmount when the filesystem gives up on a device that
     // never came back.
-    let session = match fuser::spawn_mount2(mtp_fs, mountpoint, &config) {
+    let session = match fuser::spawn_mount(mtp_fs, mountpoint, &config) {
         Ok(session) => session,
         Err(e) => {
             eprintln!("Mount failed: {e}");

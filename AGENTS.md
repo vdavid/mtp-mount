@@ -89,7 +89,7 @@ Storage IDs are re-mapped eagerly instead (there are only a few): `adopt()` matc
 
 **Blocking, and why reconnect is OFF by default.** A FUSE call that hits the disconnect blocks (holding the inner lock, so the mount is effectively frozen) until the device returns or the window expires. Waiting beats an `EIO` that makes `cp` abandon a 4 GB copy, which is why the behavior exists at all. But it blocks EVERY process touching the mount point, not just the one doing the transfer, so a file manager or backup job walking the mount freezes for the whole window on a device that's really gone. A frozen desktop is a worse default than a mount that disappears, so `ReconnectPolicy::DEFAULT_TIMEOUT_SECS` is `0` and users opt in per-cable. Don't flip the default back without solving the blocking (that means not holding the inner lock across the wait, which in turn needs `fuser`'s `n_threads` raised above 1).
 
-**Giving up.** `give_up()` prints why and raises the `Shutdown` signal. It can't unmount itself: a FUSE callback holds the inode lock and still owes the kernel a reply, and `fuser` hands the unmount handle to whoever mounted the filesystem. So `main` (and the test harness) watch the signal and call `umount_and_join`. That's also why `main` uses `spawn_mount2` rather than `mount2`: `Session::run` is `pub(crate)`, so the only way to keep a thread free for the watch loop is the background session.
+**Giving up.** `give_up()` prints why and raises the `Shutdown` signal. It can't unmount itself: a FUSE callback holds the inode lock and still owes the kernel a reply, and `fuser` hands the unmount handle to whoever mounted the filesystem. So `main` (and the test harness) watch the signal and call `umount_and_join`. That's also why `main` uses `spawn_mount` rather than `mount`: `Session::run` is `pub(crate)`, so the only way to keep a thread free for the watch loop is the background session.
 
 ## Surviving a re-keyed handle
 
@@ -128,7 +128,7 @@ mtp::watch_devices()  (mtp-rs, USB hotplug)
 Sender<Command> ------------------> Supervisor::run(Receiver<Command>)   <-- SEAM
   ^                                   |            |
   |                                   |            +-- unmount: force_unmount + verify + rmdir
-signal handler (SIGTERM/SIGINT)       +-- mount: DeviceSource -> DeviceOpener -> MtpFs -> spawn_mount2
+signal handler (SIGTERM/SIGINT)       +-- mount: DeviceSource -> DeviceOpener -> MtpFs -> spawn_mount
 give-up watcher threads (one per mount, one per Shutdown signal)
 ```
 
