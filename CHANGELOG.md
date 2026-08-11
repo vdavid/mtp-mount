@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Files can be read from responders that do not advertise either MTP partial-download operation.** The first read now starts one sequential `GetObject` stream into the existing disk-backed sparse cache; reads wait only until their requested bytes arrive, and seeks never restart a healthy stream. To avoid unexpectedly monopolizing the MTP session for very large objects, this fallback is limited to 4 GiB and returns `EFBIG` above that size. Partial-capable devices keep the existing byte-range path unchanged.
+
 ## [0.4.0] - 2026-07-20
 
 Plug a phone in and it mounts itself, a cable glitch stops being fatal, and a 40 GB copy stops being an out-of-memory risk.

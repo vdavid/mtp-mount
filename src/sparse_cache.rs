@@ -12,6 +12,10 @@
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::ops::Range;
 use std::path::Path;
+use std::sync::{Arc, Condvar, Mutex};
+
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
 
 /// A tempfile-backed cache that tracks populated byte ranges.
 #[derive(Debug)]
@@ -82,10 +86,22 @@ impl SparseCache {
         if data.is_empty() {
             return Ok(());
         }
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "cache range overflow"))?;
+        if end > self.total_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cache write [{offset}, {end}) exceeds the object size {}",
+                    self.total_size
+                ),
+            ));
+        }
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(data)?;
 
-        let new_range = offset..offset + data.len() as u64;
+        let new_range = offset..end;
         self.insert_range(new_range);
         Ok(())
     }
@@ -137,11 +153,232 @@ impl SparseCache {
     }
 }
 
+/// Why a sequential full-object fill stopped before every byte arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FillFailure {
+    message: String,
+    link_lost: bool,
+}
+
+impl FillFailure {
+    pub fn new(message: impl Into<String>, link_lost: bool) -> Self {
+        Self {
+            message: message.into(),
+            link_lost,
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn is_link_lost(&self) -> bool {
+        self.link_lost
+    }
+}
+
+#[derive(Debug)]
+enum FillState {
+    Idle,
+    Running,
+    Complete,
+    Failed(FillFailure),
+}
+
+#[derive(Debug)]
+struct SharedState {
+    cache: SparseCache,
+    fill: FillState,
+}
+
+/// One shared sparse cache plus the state of its optional sequential filler.
+///
+/// [`SparseCache`] remains the authority for whether bytes are real. The fill
+/// state only tells waiters whether more bytes can still arrive. Readers always
+/// check the requested range first, so a late stream failure cannot hide bytes
+/// that were already written successfully.
+#[derive(Debug)]
+pub struct SharedSparseCache {
+    state: Mutex<SharedState>,
+    changed: Condvar,
+}
+
+impl SharedSparseCache {
+    pub fn new(total_size: u64, spool_dir: &Path) -> io::Result<Self> {
+        Ok(Self {
+            state: Mutex::new(SharedState {
+                cache: SparseCache::new(total_size, spool_dir)?,
+                fill: FillState::Idle,
+            }),
+            changed: Condvar::new(),
+        })
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.state.lock().unwrap().cache.total_size
+    }
+
+    /// Claim the single sequential fill slot for this cache generation.
+    pub fn start_fill(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if !matches!(state.fill, FillState::Idle) {
+            return false;
+        }
+        state.fill = FillState::Running;
+        true
+    }
+
+    /// Make a failed link-loss fill eligible for one new-session retry.
+    ///
+    /// The caller performs session recovery first. Seeks and reader lifecycle
+    /// never call this, so they cannot restart a healthy in-flight stream.
+    pub fn reset_after_link_loss(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if matches!(&state.fill, FillState::Failed(failure) if failure.is_link_lost()) {
+            state.fill = FillState::Idle;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Write the next sequential chunk and wake every waiter.
+    pub fn write_sequential(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if !matches!(state.fill, FillState::Running) {
+            return Err(io::Error::other("sequential fill is not running"));
+        }
+        state.cache.write_at(offset, data)?;
+        drop(state);
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    /// Finish the fill, rejecting a stream that ended before the advertised size.
+    pub fn finish(&self, received: u64) {
+        let mut state = self.state.lock().unwrap();
+        let expected = state.cache.total_size;
+        state.fill = if received == expected {
+            FillState::Complete
+        } else {
+            FillState::Failed(FillFailure::new(
+                format!("full-object stream ended after {received} bytes; expected {expected}"),
+                false,
+            ))
+        };
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    pub fn fail(&self, failure: FillFailure) {
+        let mut state = self.state.lock().unwrap();
+        state.fill = FillState::Failed(failure);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// Block until the exact requested range is populated or can no longer arrive.
+    pub fn wait_and_read(&self, offset: u64, size: u64) -> Result<Vec<u8>, FillFailure> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if state.cache.missing_ranges(offset, size).is_empty() {
+                return state
+                    .cache
+                    .read_at(offset, size)
+                    .map_err(|error| FillFailure::new(error.to_string(), false));
+            }
+            match &state.fill {
+                FillState::Idle => {
+                    return Err(FillFailure::new("sequential fill was not started", false));
+                }
+                FillState::Running => state = self.changed.wait(state).unwrap(),
+                FillState::Complete => {
+                    return Err(FillFailure::new(
+                        "full-object stream completed without the requested range",
+                        false,
+                    ));
+                }
+                FillState::Failed(failure) => return Err(failure.clone()),
+            }
+        }
+    }
+
+    pub fn missing_ranges(&self, offset: u64, size: u64) -> Vec<Range<u64>> {
+        self.state
+            .lock()
+            .unwrap()
+            .cache
+            .missing_ranges(offset, size)
+    }
+
+    pub fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.state.lock().unwrap().cache.write_at(offset, data)
+    }
+
+    pub fn read_at(&self, offset: u64, size: u64) -> io::Result<Vec<u8>> {
+        self.state.lock().unwrap().cache.read_at(offset, size)
+    }
+}
+
+/// Consume a full-object stream to completion, publishing each chunk only
+/// after it has been written successfully into the sparse cache.
+pub async fn fill_from_stream<S, E, F>(cache: Arc<SharedSparseCache>, stream: S, is_link_lost: F)
+where
+    S: Stream<Item = Result<Bytes, E>>,
+    E: std::fmt::Display,
+    F: Fn(&E) -> bool,
+{
+    futures::pin_mut!(stream);
+    let mut offset = 0u64;
+    let mut write_failure = None;
+    let expected = cache.total_size();
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                cache.fail(FillFailure::new(error.to_string(), is_link_lost(&error)));
+                return;
+            }
+        };
+
+        if write_failure.is_none() {
+            let remaining = usize::try_from(expected.saturating_sub(offset)).unwrap_or(usize::MAX);
+            let writable = bytes.len().min(remaining);
+            if let Err(error) = cache.write_sequential(offset, &bytes[..writable]) {
+                write_failure = Some(FillFailure::new(error.to_string(), false));
+            } else if writable != bytes.len() {
+                write_failure = Some(FillFailure::new(
+                    format!("full-object stream exceeded the advertised size of {expected} bytes"),
+                    false,
+                ));
+            }
+        }
+        offset = match offset.checked_add(bytes.len() as u64) {
+            Some(offset) => offset,
+            None => {
+                write_failure.get_or_insert_with(|| {
+                    FillFailure::new("full-object stream byte count overflowed u64", false)
+                });
+                u64::MAX
+            }
+        };
+    }
+    if let Some(failure) = write_failure {
+        cache.fail(failure);
+    } else {
+        cache.finish(offset);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)] // intentional: asserting populated_ranges matches a one-range slice
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     /// Unlinked temp files, so the system temp dir is fine for tests; production
     /// resolves a disk-backed spool dir instead.
@@ -284,5 +521,184 @@ mod tests {
         cache.write_at(200, &[0u8; 100]).unwrap();
         cache.write_at(100, &[0u8; 100]).unwrap();
         assert_eq!(cache.populated_ranges(), &[0..300]);
+    }
+
+    #[test]
+    fn write_past_advertised_size_is_rejected_without_marking_bytes() {
+        let mut cache = SparseCache::new(4, &spool()).unwrap();
+        let error = cache.write_at(2, b"abc").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(cache.missing_ranges(0, 4), vec![0..4]);
+    }
+
+    #[tokio::test]
+    async fn normal_stream_populates_and_completes_the_cache() {
+        let cache = Arc::new(SharedSparseCache::new(6, &spool()).unwrap());
+        assert!(cache.start_fill());
+        fill_from_stream(
+            Arc::clone(&cache),
+            futures::stream::iter(vec![
+                Ok::<_, io::Error>(Bytes::from_static(b"abc")),
+                Ok(Bytes::from_static(b"def")),
+            ]),
+            |_| false,
+        )
+        .await;
+
+        assert_eq!(cache.wait_and_read(0, 6).unwrap(), b"abcdef");
+        assert!(!cache.start_fill(), "a completed cache gets no second fill");
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_keeps_its_prefix_but_rejects_the_missing_tail() {
+        let cache = Arc::new(SharedSparseCache::new(6, &spool()).unwrap());
+        assert!(cache.start_fill());
+        fill_from_stream(
+            Arc::clone(&cache),
+            futures::stream::iter(vec![Ok::<_, io::Error>(Bytes::from_static(b"abc"))]),
+            |_| false,
+        )
+        .await;
+
+        assert_eq!(cache.wait_and_read(0, 3).unwrap(), b"abc");
+        let failure = cache.wait_and_read(3, 3).unwrap_err();
+        assert!(failure.message().contains("ended after 3 bytes"));
+    }
+
+    #[tokio::test]
+    async fn stream_failure_after_a_range_lands_does_not_hide_that_range() {
+        let cache = Arc::new(SharedSparseCache::new(6, &spool()).unwrap());
+        assert!(cache.start_fill());
+        fill_from_stream(
+            Arc::clone(&cache),
+            futures::stream::iter(vec![
+                Ok(Bytes::from_static(b"abc")),
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "device left")),
+            ]),
+            |error| error.kind() == io::ErrorKind::BrokenPipe,
+        )
+        .await;
+
+        assert_eq!(cache.wait_and_read(0, 3).unwrap(), b"abc");
+        let failure = cache.wait_and_read(3, 3).unwrap_err();
+        assert!(failure.is_link_lost());
+        assert_eq!(failure.message(), "device left");
+    }
+
+    #[tokio::test]
+    async fn stream_failure_before_a_range_arrives_returns_no_hole_bytes() {
+        let cache = Arc::new(SharedSparseCache::new(6, &spool()).unwrap());
+        assert!(cache.start_fill());
+        fill_from_stream(
+            Arc::clone(&cache),
+            futures::stream::iter(vec![Err::<Bytes, _>(io::Error::other("stream failed"))]),
+            |_| false,
+        )
+        .await;
+
+        assert_eq!(cache.missing_ranges(0, 3), vec![0..3]);
+        assert_eq!(
+            cache.wait_and_read(0, 3).unwrap_err().message(),
+            "stream failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_write_failure_still_drains_the_stream_to_eof() {
+        let cache = Arc::new(SharedSparseCache::new(3, &spool()).unwrap());
+        assert!(cache.start_fill());
+        let chunks_seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&chunks_seen);
+        let stream = futures::stream::iter(vec![
+            Ok::<_, io::Error>(Bytes::from_static(b"abc")),
+            Ok(Bytes::from_static(b"de")),
+            Ok(Bytes::from_static(b"fg")),
+        ])
+        .inspect(move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        fill_from_stream(Arc::clone(&cache), stream, |_| false).await;
+
+        assert_eq!(chunks_seen.load(Ordering::Relaxed), 3);
+        assert_eq!(cache.wait_and_read(0, 3).unwrap(), b"abc");
+        assert!(!cache.start_fill(), "a failed fill cannot silently restart");
+    }
+
+    #[test]
+    fn a_reader_waits_until_its_entire_range_is_valid() {
+        let cache = Arc::new(SharedSparseCache::new(4, &spool()).unwrap());
+        assert!(cache.start_fill());
+        let (tx, rx) = mpsc::channel();
+        let reader = Arc::clone(&cache);
+        thread::spawn(move || tx.send(reader.wait_and_read(0, 4)).unwrap());
+
+        cache.write_sequential(0, b"ab").unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        cache.write_sequential(2, b"cd").unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap(),
+            b"abcd"
+        );
+        cache.finish(4);
+    }
+
+    #[test]
+    fn overlapping_and_far_forward_readers_wake_as_their_ranges_land() {
+        let cache = Arc::new(SharedSparseCache::new(16, &spool()).unwrap());
+        assert!(cache.start_fill());
+        let (near_tx, near_rx) = mpsc::channel();
+        let (far_tx, far_rx) = mpsc::channel();
+        let near = Arc::clone(&cache);
+        let far = Arc::clone(&cache);
+        thread::spawn(move || near_tx.send(near.wait_and_read(4, 4)).unwrap());
+        thread::spawn(move || far_tx.send(far.wait_and_read(10, 4)).unwrap());
+
+        cache.write_sequential(0, b"abcdefgh").unwrap();
+        assert_eq!(
+            near_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            b"efgh"
+        );
+        assert!(far_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        cache.write_sequential(8, b"ijklmnop").unwrap();
+        assert_eq!(
+            far_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            b"klmn"
+        );
+        cache.finish(16);
+    }
+
+    #[test]
+    fn repeated_reads_reuse_bytes_and_eof_never_starts_a_fill() {
+        let cache = SharedSparseCache::new(4, &spool()).unwrap();
+        assert!(cache.start_fill());
+        cache.write_sequential(0, b"data").unwrap();
+        cache.finish(4);
+        assert_eq!(cache.wait_and_read(1, 2).unwrap(), b"at");
+        assert_eq!(cache.wait_and_read(1, 2).unwrap(), b"at");
+
+        let eof = SharedSparseCache::new(4, &spool()).unwrap();
+        assert_eq!(eof.wait_and_read(4, 100).unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn only_link_loss_can_reset_a_failed_fill() {
+        let cache = SharedSparseCache::new(4, &spool()).unwrap();
+        assert!(cache.start_fill());
+        cache.fail(FillFailure::new("protocol error", false));
+        assert!(!cache.reset_after_link_loss());
+
+        let cache = SharedSparseCache::new(4, &spool()).unwrap();
+        assert!(cache.start_fill());
+        cache.fail(FillFailure::new("device left", true));
+        assert!(cache.reset_after_link_loss());
+        assert!(cache.start_fill());
+        assert!(!cache.start_fill(), "the retry still owns exactly one slot");
     }
 }

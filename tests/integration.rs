@@ -97,6 +97,7 @@ struct TestMount {
     /// How many times the mount has opened (or reopened) the device.
     opens: Arc<AtomicU32>,
     fetch_counter: Arc<AtomicU64>,
+    full_fill_counter: Arc<AtomicU64>,
     unplug: UnplugSwitch,
     shutdown: Arc<Shutdown>,
     session: Arc<Mutex<Option<fuser::BackgroundSession>>>,
@@ -213,6 +214,7 @@ impl TestMount {
             },
         );
         let fetch_counter = mtp_fs.fetch_counter();
+        let full_fill_counter = mtp_fs.full_fill_counter();
         let shutdown = mtp_fs.shutdown();
         let mount_options = mtp_fs.mount_options();
 
@@ -257,6 +259,7 @@ impl TestMount {
             serial,
             opens,
             fetch_counter,
+            full_fill_counter,
             unplug,
             shutdown,
             session,
@@ -295,6 +298,11 @@ impl TestMount {
     /// Current count of MTP partial-read fetches.
     fn fetch_count(&self) -> u64 {
         self.fetch_counter.load(Ordering::Relaxed)
+    }
+
+    /// Current count of full-object fallback streams.
+    fn full_fill_count(&self) -> u64 {
+        self.full_fill_counter.load(Ordering::Relaxed)
     }
 
     /// Path to the FUSE mount point.
@@ -752,6 +760,11 @@ fn test_cache_prevents_refetch() {
     file.read_exact(&mut buf).expect("read failed");
     let after_first = mount.fetch_count();
     assert!(after_first > 0, "expected at least one fetch on first read");
+    assert_eq!(
+        mount.full_fill_count(),
+        0,
+        "a partial-capable device must not use the full-object fallback"
+    );
 
     // Second read of an overlapping range (fully covered by first) should not refetch.
     file.seek(SeekFrom::Start(505_000)).expect("seek failed");

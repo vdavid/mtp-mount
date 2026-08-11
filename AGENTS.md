@@ -61,7 +61,7 @@ mtp-rs (MtpDevice, Storage + next_event)
 **Entry point:** `main.rs` parses CLI args, opens the MTP device via `mtp-rs`, and starts the FUSE session via `fuser`.
 
 **Key design choices:**
-- **Reads** are byte-range on-demand via `Storage::read_range`. Each open file handle has a `SparseCache` (tempfile + sorted `Vec<Range<u64>>` of populated ranges). FUSE `read(offset, size)` asks the cache for missing ranges, fetches them in 1 MB chunks, writes them into the tempfile, and serves the requested slice. No full-file download on open; supports files > 4 GB.
+- **Reads** use one `SharedSparseCache` per open file handle, with `SparseCache` (tempfile + sorted `Vec<Range<u64>>` of populated ranges) remaining the authority for which bytes are valid. Partial-capable responders use `Storage::read_range` in 1 MiB chunks exactly as before. A responder with neither partial-download operation gets one capability-gated `Storage::download(ByteRange::Full)` filler for objects up to `FULL_DOWNLOAD_LIMIT` (4 GiB): the task owns `FileDownload` through EOF, publishes chunks after disk writes, and wakes range waiters. Seeks and `release` must never cancel or restart a healthy filler; only unavoidable link loss may start a new-session retry. Above the bound, return `EFBIG` before opening a stream.
 - **Writes** buffer to a temp file in the spool dir, flushed to MTP on `release`. The flush hands `Storage::upload` a
   lazy stream over the spool file (`fs::file_stream`, 64 KiB per chunk), so an upload holds one chunk in memory
   regardless of file size. Don't collect those chunks into a `Vec` first: that puts the whole file back in RAM, which
@@ -194,7 +194,7 @@ notices a dead session on its next operation, the USB watch only on its next pol
 
 ## Testing
 
-- **Unit tests** (99): inode table, write buffer, sparse cache, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal, mount-root resolution, device directory naming, mountpoint detection, stale-mount sweep, dry-run key derivation. Run with `cargo test`.
+- **Library unit tests** (111): inode table, write buffer, sparse cache and sequential-fill coordination, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal, mount-root resolution, device directory naming, mountpoint detection, stale-mount sweep, dry-run key derivation. Run with `cargo test --lib`.
 - **Integration tests** (29): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring, partial reads, reconnects, and re-keyed handles. Linux only (needs `libfuse3-dev`), except the one non-ignored test below. Run with `cargo test --test integration -- --ignored --test-threads=1`
 - **Daemon tests** (8, `tests/daemon.rs`): drive `Supervisor` through its command channel and assert against the real filesystem. Linux only, `cargo test --test daemon -- --ignored --test-threads=1`. See below.
 - **Dry-run tests** (7, `tests/dry_run.rs`): inject arrivals and departures into the `--dry-run` reporter and assert on the verdict, the wording a person reads, and that a run leaves a temp mount root untouched. No FUSE, no device, so they run everywhere with plain `cargo test`.
