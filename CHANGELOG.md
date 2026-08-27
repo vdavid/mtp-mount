@@ -7,9 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-27
+
+Devices that can only hand over whole files now work, and a transfer in flight survives being interrupted.
+
+### Added
+
+- **Files can be read from devices that can't send byte ranges.** Some MTP responders handle neither partial-read operation, most visibly the Nintendo Switch's MTP apps (libhaze/Sphaira); every read of every file on one used to fail with `EIO`. The first read now starts one whole-file download into the same disk-backed sparse cache the normal path uses, and each read returns as soon as its own bytes arrive, so a big file starts flowing right away rather than after the whole transfer. Seeking ahead waits for that stream instead of restarting it, and closing the file doesn't cut it off. A stream that dies partway leaves the rest unread rather than serving zeros: only bytes the device actually sent are ever handed back. Thanks to [@oenderg](https://github.com/oenderg) for finding the device, tracing it to libhaze's operation table, and building this ([#9](https://github.com/vdavid/mtp-mount/issues/9), [#11](https://github.com/vdavid/mtp-mount/pull/11)).
+- **`--full-download-limit <SIZE>`** (both binaries) caps that fallback, defaulting to 4 GB. One whole-file download holds the device for its entire length and everything else touching the mount waits behind it, so a background thumbnailer opening a 30 GB file would freeze the mount for a quarter of an hour. Files above the limit are refused with "File too large" instead. Raise it (`--full-download-limit 32G`) or pass `0` when you mean to copy a big one. Takes `8G`, `512M`, `1048576`, and the `KiB`/`MiB` spellings.
+- **`Ctrl+C` on `mtp-mount` unmounts instead of killing the process where it stands.** It always said it would; now it does. `SIGINT` and `SIGTERM` unmount, cancel any transfer in flight, and wait for the device to acknowledge before exiting.
+
 ### Fixed
 
-- **Files can be read from responders that do not advertise either MTP partial-download operation.** The first read now starts one sequential `GetObject` stream into the existing disk-backed sparse cache; reads wait only until their requested bytes arrive, and seeks never restart a healthy stream. To avoid unexpectedly monopolizing the MTP session for very large objects, this fallback is limited to 4 GiB and returns `EFBIG` above that size. Partial-capable devices keep the existing byte-range path unchanged.
+- **A transfer in flight is cancelled rather than abandoned when a mount goes away.** Dropping a live MTP download leaves the device in the middle of a USB transaction, which on Android is the failure that needs a physical replug. Both binaries now tell the device to stop and wait (briefly, and never longer than a few seconds) before they exit.
+- **A device that returns more bytes than it was asked for no longer fails the read.** The extra bytes are dropped with a warning instead of turning into an `EIO` on the last chunk of every file.
+- **Reading a file twice at once downloads it once.** The read cache is now keyed by file rather than by file descriptor, so two processes reading the same file, or a thumbnailer that opens it, reads the header, closes, and reopens, share one transfer instead of asking the device for the same object twice.
 
 ## [0.4.0] - 2026-07-20
 
