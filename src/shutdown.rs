@@ -6,6 +6,7 @@
 //! the callback records why here and returns an error; the thread that owns the
 //! mount picks the reason up and unmounts.
 
+use log::error;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -48,6 +49,44 @@ impl Shutdown {
             .unwrap();
         slot.clone()
     }
+}
+
+/// Turn a stop signal into whatever the caller wants to stop.
+///
+/// `systemd` stops services with `SIGTERM`, and a person stops one in a
+/// terminal with `SIGINT`. Both have to unmount everything on the way out:
+/// mounts left behind after a `systemctl --user stop` are exactly the wedged
+/// directories the daemon exists to avoid. The single-device binary catches
+/// the same signals for a different reason: a whole-object read holds the MTP
+/// session for the entire transfer, and it has to be cancelled rather than cut.
+pub fn spawn_signal_handler<F>(rt: &tokio::runtime::Handle, on_signal: F)
+where
+    F: FnOnce(&str) + Send + 'static,
+{
+    rt.spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!("Can't listen for SIGTERM: {e}");
+                return;
+            }
+        };
+        let mut interrupt = match signal(SignalKind::interrupt()) {
+            Ok(stream) => stream,
+            Err(e) => {
+                error!("Can't listen for SIGINT: {e}");
+                return;
+            }
+        };
+
+        let signal_name = tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        };
+        on_signal(signal_name);
+    });
 }
 
 #[cfg(test)]

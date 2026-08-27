@@ -147,7 +147,9 @@ grabbing devices with `systemctl --user mask gvfs-mtp-volume-monitor`.
 - **Directories**: `ls`, `mkdir`, `rmdir`
 - **Delete**: `rm`
 - **Rename and move**: `mv`
-- **Large files**: files larger than 4 GB read end-to-end on devices that advertise an MTP partial-download operation
+- **Large files**: files larger than 4 GB read end-to-end
+- **Devices that can't send byte ranges**: a few (some Nintendo Switch MTP apps, simple PTP responders) can only hand
+  over whole files. Those work too, with one caveat below
 - **Flaky cables**: the mount survives a device that drops off the bus and comes back
 
 ## What doesn't work (and why)
@@ -163,12 +165,19 @@ MTP is an object-based protocol, not a block device, so some POSIX features just
 
 The FUSE layer translates filesystem calls into MTP operations:
 
-- **Reads are byte-range on-demand when the responder supports it.** Each FUSE `read(offset, size)` fetches only the
-  missing bytes via MTP's partial-download operations, writes them into a sparse tempfile, and serves the requested
-  slice. Repeated reads of the same region hit the local cache. On responders with no partial-download operation, the
-  first read starts one sequential full-object stream into that same cache and later reads wait for their requested
-  range to arrive; seeks and file-handle close never restart or abort that stream. This fallback refuses objects above
-  4 GiB with `EFBIG` rather than monopolizing the MTP session for an unbounded full download.
+- **Reads are byte-range on-demand.** Each FUSE `read(offset, size)` fetches only the missing bytes via MTP's
+  partial-download operations, writes them into a sparse tempfile, and serves the requested slice. Repeated reads of
+  the same region hit the local cache. Scrubbing a 10 GB video only downloads what you actually touch.
+- **Devices that can't send byte ranges get one whole-file download** into that same cache, and each read returns as
+  soon as its own bytes arrive, so a big file starts flowing right away instead of after the whole transfer. Seeking
+  ahead waits for that stream rather than restarting it, and closing the file doesn't cut it off. The catch: one such
+  download holds the device for its whole length, and everything else touching the mount waits behind it. So files
+  above `--full-download-limit` (4 GB by default) are refused with "File too large" instead, and you raise the limit
+  (or pass `0`) when you mean to copy a big one:
+
+  ```bash
+  mtp-mount --full-download-limit 32G /mnt/switch
+  ```
 - **Writes spool to disk**, then upload to the device on close. The spool lives in your cache directory, not `/tmp`:
   on most current Linux distros `/tmp` is a tmpfs (RAM), and a 4 GB upload buffered there would fill memory. The upload
   streams from the spool file in 64 KiB chunks, so memory stays flat no matter how big the file is.

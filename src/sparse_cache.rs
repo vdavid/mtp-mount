@@ -9,13 +9,13 @@
 //!
 //! Ranges are kept sorted and merged so that adjacent writes coalesce.
 
+use std::future::Future;
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
 
 /// A tempfile-backed cache that tracks populated byte ranges.
 #[derive(Debug)]
@@ -189,6 +189,10 @@ enum FillState {
 struct SharedState {
     cache: SparseCache,
     fill: FillState,
+    /// Set when the mount is going away and a running fill should stop early.
+    /// The filler reacts by cancelling its MTP transfer, which is the only safe
+    /// way to stop one (see [`ObjectStream::cancel`]).
+    stop_requested: bool,
 }
 
 /// One shared sparse cache plus the state of its optional sequential filler.
@@ -209,6 +213,7 @@ impl SharedSparseCache {
             state: Mutex::new(SharedState {
                 cache: SparseCache::new(total_size, spool_dir)?,
                 fill: FillState::Idle,
+                stop_requested: false,
             }),
             changed: Condvar::new(),
         })
@@ -226,6 +231,31 @@ impl SharedSparseCache {
         }
         state.fill = FillState::Running;
         true
+    }
+
+    /// Whether a sequential fill is in flight right now.
+    ///
+    /// A cache whose filler is still running has to outlive the last `close()`
+    /// on the file: the stream cannot be abandoned, and the bytes it is still
+    /// writing are the ones a reopen would otherwise re-download from zero.
+    pub fn is_filling(&self) -> bool {
+        matches!(self.state.lock().unwrap().fill, FillState::Running)
+    }
+
+    /// Ask a running fill to stop at its next chunk boundary.
+    ///
+    /// This is for the mount going away, not for readers: a seek or a `close()`
+    /// must never reach it, or a healthy transfer would restart from byte zero.
+    pub fn request_stop(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.stop_requested = true;
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// Whether [`request_stop`](Self::request_stop) has been called.
+    pub fn stop_requested(&self) -> bool {
+        self.state.lock().unwrap().stop_requested
     }
 
     /// Make a failed link-loss fill eligible for one new-session retry.
@@ -320,24 +350,69 @@ impl SharedSparseCache {
     }
 }
 
-/// Consume a full-object stream to completion, publishing each chunk only
-/// after it has been written successfully into the sparse cache.
-pub async fn fill_from_stream<S, E, F>(cache: Arc<SharedSparseCache>, stream: S, is_link_lost: F)
+/// A whole-object download, reduced to what a sequential fill needs.
+///
+/// The `cancel` half is why this is a trait rather than a plain
+/// [`futures::Stream`]: `mtp-rs` marks its `FileDownload` `#[must_use]` because
+/// dropping one mid-transfer leaves the responder in the middle of a USB
+/// transaction, and on Android that is the failure that needs a physical
+/// replug. A fill that has to stop early therefore has to *say so* to the
+/// device rather than let the stream fall out of scope.
+pub trait ObjectStream {
+    /// How this stream reports a transport or protocol failure.
+    type Error: std::fmt::Display;
+
+    /// The next chunk, or `None` at end of transfer.
+    fn next_chunk(&mut self) -> impl Future<Output = Option<Result<Bytes, Self::Error>>> + Send;
+
+    /// Stop the transfer cleanly, draining whatever the device still owes.
+    fn cancel(&mut self) -> impl Future<Output = ()> + Send;
+}
+
+/// Why [`fill_from_stream`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillOutcome {
+    /// The stream reached end of transfer (whether or not every byte landed).
+    Finished,
+    /// [`SharedSparseCache::request_stop`] was raised and the transfer was cancelled.
+    Stopped,
+}
+
+/// Consume a whole-object stream, publishing each chunk only after it has been
+/// written successfully into the sparse cache.
+///
+/// This owns the stream from here to the end of the transfer. Reader seeks, an
+/// interrupted `read()`, and `close()` cannot reach it; only
+/// [`SharedSparseCache::request_stop`] can, and that cancels rather than drops.
+pub async fn fill_from_stream<S, F>(
+    cache: Arc<SharedSparseCache>,
+    mut stream: S,
+    is_link_lost: F,
+) -> FillOutcome
 where
-    S: Stream<Item = Result<Bytes, E>>,
-    E: std::fmt::Display,
-    F: Fn(&E) -> bool,
+    S: ObjectStream,
+    F: Fn(&S::Error) -> bool,
 {
-    futures::pin_mut!(stream);
     let mut offset = 0u64;
     let mut write_failure = None;
     let expected = cache.total_size();
-    while let Some(chunk) = stream.next().await {
+    loop {
+        if cache.stop_requested() {
+            stream.cancel().await;
+            cache.fail(FillFailure::new(
+                "the whole-object download was stopped because the mount is going away",
+                false,
+            ));
+            return FillOutcome::Stopped;
+        }
+        let Some(chunk) = stream.next_chunk().await else {
+            break;
+        };
         let bytes = match chunk {
             Ok(bytes) => bytes,
             Err(error) => {
                 cache.fail(FillFailure::new(error.to_string(), is_link_lost(&error)));
-                return;
+                return FillOutcome::Finished;
             }
         };
 
@@ -368,17 +443,53 @@ where
     } else {
         cache.finish(offset);
     }
+    FillOutcome::Finished
 }
 
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)] // intentional: asserting populated_ranges matches a one-range slice
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    /// A scripted [`ObjectStream`] that records what was pulled and whether it
+    /// was cancelled.
+    struct FakeStream {
+        chunks: VecDeque<Result<Bytes, io::Error>>,
+        chunks_pulled: Arc<AtomicUsize>,
+        cancelled: Arc<AtomicUsize>,
+    }
+
+    impl FakeStream {
+        fn new(chunks: Vec<Result<Bytes, io::Error>>) -> Self {
+            Self {
+                chunks: chunks.into(),
+                chunks_pulled: Arc::new(AtomicUsize::new(0)),
+                cancelled: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl ObjectStream for FakeStream {
+        type Error = io::Error;
+
+        async fn next_chunk(&mut self) -> Option<Result<Bytes, io::Error>> {
+            let chunk = self.chunks.pop_front();
+            if chunk.is_some() {
+                self.chunks_pulled.fetch_add(1, Ordering::Relaxed);
+            }
+            chunk
+        }
+
+        async fn cancel(&mut self) {
+            self.cancelled.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     /// Unlinked temp files, so the system temp dir is fine for tests; production
     /// resolves a disk-backed spool dir instead.
@@ -537,8 +648,8 @@ mod tests {
         assert!(cache.start_fill());
         fill_from_stream(
             Arc::clone(&cache),
-            futures::stream::iter(vec![
-                Ok::<_, io::Error>(Bytes::from_static(b"abc")),
+            FakeStream::new(vec![
+                Ok(Bytes::from_static(b"abc")),
                 Ok(Bytes::from_static(b"def")),
             ]),
             |_| false,
@@ -555,7 +666,7 @@ mod tests {
         assert!(cache.start_fill());
         fill_from_stream(
             Arc::clone(&cache),
-            futures::stream::iter(vec![Ok::<_, io::Error>(Bytes::from_static(b"abc"))]),
+            FakeStream::new(vec![Ok(Bytes::from_static(b"abc"))]),
             |_| false,
         )
         .await;
@@ -571,7 +682,7 @@ mod tests {
         assert!(cache.start_fill());
         fill_from_stream(
             Arc::clone(&cache),
-            futures::stream::iter(vec![
+            FakeStream::new(vec![
                 Ok(Bytes::from_static(b"abc")),
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "device left")),
             ]),
@@ -591,7 +702,7 @@ mod tests {
         assert!(cache.start_fill());
         fill_from_stream(
             Arc::clone(&cache),
-            futures::stream::iter(vec![Err::<Bytes, _>(io::Error::other("stream failed"))]),
+            FakeStream::new(vec![Err(io::Error::other("stream failed"))]),
             |_| false,
         )
         .await;
@@ -607,20 +718,22 @@ mod tests {
     async fn local_write_failure_still_drains_the_stream_to_eof() {
         let cache = Arc::new(SharedSparseCache::new(3, &spool()).unwrap());
         assert!(cache.start_fill());
-        let chunks_seen = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&chunks_seen);
-        let stream = futures::stream::iter(vec![
-            Ok::<_, io::Error>(Bytes::from_static(b"abc")),
+        let stream = FakeStream::new(vec![
+            Ok(Bytes::from_static(b"abc")),
             Ok(Bytes::from_static(b"de")),
             Ok(Bytes::from_static(b"fg")),
-        ])
-        .inspect(move |_| {
-            counter.fetch_add(1, Ordering::Relaxed);
-        });
+        ]);
+        let chunks_seen = Arc::clone(&stream.chunks_pulled);
+        let cancelled = Arc::clone(&stream.cancelled);
 
         fill_from_stream(Arc::clone(&cache), stream, |_| false).await;
 
         assert_eq!(chunks_seen.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            cancelled.load(Ordering::Relaxed),
+            0,
+            "a local write failure drains the transfer rather than cancelling it"
+        );
         assert_eq!(cache.wait_and_read(0, 3).unwrap(), b"abc");
         assert!(!cache.start_fill(), "a failed fill cannot silently restart");
     }
@@ -685,6 +798,62 @@ mod tests {
 
         let eof = SharedSparseCache::new(4, &spool()).unwrap();
         assert_eq!(eof.wait_and_read(4, 100).unwrap(), Vec::<u8>::new());
+    }
+
+    #[tokio::test]
+    async fn a_stop_request_cancels_the_transfer_instead_of_dropping_it() {
+        let cache = Arc::new(SharedSparseCache::new(6, &spool()).unwrap());
+        assert!(cache.start_fill());
+        let stream = FakeStream::new(vec![
+            Ok(Bytes::from_static(b"abc")),
+            Ok(Bytes::from_static(b"def")),
+        ]);
+        let cancelled = Arc::clone(&stream.cancelled);
+        let chunks_pulled = Arc::clone(&stream.chunks_pulled);
+        cache.request_stop();
+
+        let outcome = fill_from_stream(Arc::clone(&cache), stream, |_| false).await;
+
+        assert_eq!(outcome, FillOutcome::Stopped);
+        assert_eq!(cancelled.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            chunks_pulled.load(Ordering::Relaxed),
+            0,
+            "the stop lands before the next chunk, not after the rest of the file"
+        );
+        // A reader blocked on the stopped fill is released with a reason, never
+        // with bytes the device did not send.
+        assert!(cache
+            .wait_and_read(0, 6)
+            .unwrap_err()
+            .message()
+            .contains("going away"));
+    }
+
+    #[tokio::test]
+    async fn a_stop_mid_transfer_keeps_the_bytes_that_already_landed() {
+        let cache = Arc::new(SharedSparseCache::new(6, &spool()).unwrap());
+        assert!(cache.start_fill());
+        cache.write_sequential(0, b"abc").unwrap();
+        cache.request_stop();
+
+        let stream = FakeStream::new(vec![Ok(Bytes::from_static(b"def"))]);
+        let cancelled = Arc::clone(&stream.cancelled);
+        fill_from_stream(Arc::clone(&cache), stream, |_| false).await;
+
+        assert_eq!(cancelled.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.wait_and_read(0, 3).unwrap(), b"abc");
+        assert!(cache.wait_and_read(3, 3).is_err());
+    }
+
+    #[test]
+    fn a_running_fill_reports_itself_so_its_cache_outlives_the_last_close() {
+        let cache = SharedSparseCache::new(4, &spool()).unwrap();
+        assert!(!cache.is_filling());
+        assert!(cache.start_fill());
+        assert!(cache.is_filling());
+        cache.finish(4);
+        assert!(!cache.is_filling());
     }
 
     #[test]

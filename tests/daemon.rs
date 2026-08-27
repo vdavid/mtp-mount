@@ -518,6 +518,7 @@ fn stale_mount_helper() {
             read_only: false,
             spool_dir: std::env::temp_dir(),
             reconnect: mtp_mount::reconnect::ReconnectPolicy::from_secs(0),
+            full_download_limit: mtp_mount::fs::DEFAULT_FULL_DOWNLOAD_LIMIT,
             unplug: mtp_mount::device::UnplugSwitch::default(),
         },
     );

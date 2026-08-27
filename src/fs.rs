@@ -11,9 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, KernelConfig, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request,
-    TimeOrNow, WriteFlags,
+    INodeNo, KernelConfig, LockOwner, MountOption, OpenAccMode, OpenFlags, RenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs,
+    ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 use log::{debug, error, info, warn};
 use mtp_rs::mtp::{DeviceEvent, MtpDevice};
@@ -21,31 +21,48 @@ use mtp_rs::{ByteRange, NewObjectInfo, ObjectHandle, Storage};
 
 use crate::buffer::WriteBuffer;
 use crate::device::{is_link_lost, DeviceOpener, UnplugSwitch};
+use crate::fill::FillTracker;
 use crate::inode::{ChildInfo, InodeEntry, InodeKind, InodeTable, FUSE_ROOT_INODE};
 use crate::reconnect::ReconnectPolicy;
 use crate::shutdown::Shutdown;
-use crate::sparse_cache::{fill_from_stream, FillFailure, SharedSparseCache};
+use crate::sparse_cache::{fill_from_stream, FillFailure, ObjectStream, SharedSparseCache};
 
 const TTL: Duration = Duration::from_secs(1);
 
 /// How much of a spool file an upload holds in memory at a time.
 const UPLOAD_CHUNK: usize = 65536;
 
-/// Largest object that may automatically monopolize the MTP session for one
-/// full-object fallback download when the responder has no partial-read op.
-pub const FULL_DOWNLOAD_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+/// Default ceiling on the whole-object fallback: the largest object a responder
+/// with no partial-read operation will be read for without being asked twice.
+///
+/// The bound is not about what the device can do, it's about what a background
+/// process can do to you. A fill holds the device's one session for the entire
+/// transfer, and with `fuser`'s single event-loop thread every other process on
+/// the mount waits behind it, so a thumbnailer that opens a 30 GB file freezes
+/// the mount for a quarter of an hour. No value avoids that (1 GiB over a 20
+/// MiB/s link is already ~50 seconds), so this caps the damage rather than
+/// preventing it, and `--full-download-limit` is how someone who *means* to copy
+/// a big file lifts it. Same shape as [`ReconnectPolicy::DEFAULT_TIMEOUT_SECS`]:
+/// conservative by default, opt in when you know what you're waiting for.
+pub const DEFAULT_FULL_DOWNLOAD_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 
+/// How a read gets its bytes, decided per object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadStrategy {
+    /// The responder has a partial-read op: fetch just the missing ranges.
     Ranged,
+    /// No partial-read op: one whole-object stream fills the cache as it lands.
     SequentialFull,
+    /// No partial-read op and the object is over the limit, so reading it would
+    /// mean an unbounded hold on the session that nobody asked for.
     TooLargeForSequentialFull,
 }
 
-fn read_strategy(supports_partial_download: bool, object_size: u64) -> ReadStrategy {
+/// Pick the read path. `limit` of `0` means no ceiling.
+fn read_strategy(supports_partial_download: bool, object_size: u64, limit: u64) -> ReadStrategy {
     if supports_partial_download {
         ReadStrategy::Ranged
-    } else if object_size <= FULL_DOWNLOAD_LIMIT {
+    } else if limit == 0 || object_size <= limit {
         ReadStrategy::SequentialFull
     } else {
         ReadStrategy::TooLargeForSequentialFull
@@ -75,6 +92,31 @@ const MAX_STALE_RETRIES: u32 = 1;
 
 type MtpResult<T> = Result<T, mtp_rs::Error>;
 
+/// How long a cancel waits for the device to stop talking before giving up.
+/// `mtp-rs` drains the pipe over this window; it is a round-trip, not a
+/// transfer, so it stays short even for a 30 GB object.
+const CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// `mtp-rs`'s whole-object download, as the sequential fill sees it.
+struct FullObjectStream(mtp_rs::FileDownload);
+
+impl ObjectStream for FullObjectStream {
+    type Error = mtp_rs::Error;
+
+    async fn next_chunk(&mut self) -> Option<Result<bytes::Bytes, mtp_rs::Error>> {
+        self.0.next_chunk().await
+    }
+
+    async fn cancel(&mut self) {
+        // A cancel that fails has still done the useful part (the request went
+        // out); there is nothing better left to try, and the mount is on its way
+        // out anyway. Say so and move on rather than block the unmount.
+        if let Err(error) = self.0.cancel(CANCEL_DRAIN_TIMEOUT).await {
+            warn!("Cancelling the whole-object download did not complete cleanly: {error}");
+        }
+    }
+}
+
 /// Everything the mount needs beyond the device itself.
 pub struct MtpFsConfig {
     pub read_only: bool,
@@ -84,6 +126,9 @@ pub struct MtpFsConfig {
     pub spool_dir: PathBuf,
     /// How long to wait for a device that went away.
     pub reconnect: ReconnectPolicy,
+    /// Ceiling on the whole-object read fallback, in bytes. `0` lifts it.
+    /// See [`DEFAULT_FULL_DOWNLOAD_LIMIT`].
+    pub full_download_limit: u64,
     /// The pretend cable, shared with the [`DeviceOpener`] (tests only).
     pub unplug: UnplugSwitch,
 }
@@ -203,6 +248,9 @@ struct Inner {
     spool_dir: PathBuf,
     inodes: InodeTable,
     write_buf: WriteBuffer,
+    /// One sparse cache per *open object*, keyed by inode rather than by file
+    /// handle: two file descriptors on the same file share the bytes, and on the
+    /// whole-object path they share the single download instead of racing two.
     read_cache: HashMap<u64, Arc<SharedSparseCache>>,
     dirs_loaded: HashMap<u64, bool>,
     fh_to_inode: HashMap<u64, u64>,
@@ -231,6 +279,11 @@ pub struct MtpFs {
     /// Counter incremented when a no-partial responder starts a full-object
     /// filler. Used to pin the capability split in tests.
     full_fill_counter: Arc<AtomicU64>,
+    /// Ceiling on the whole-object fallback, in bytes (`0` lifts it).
+    full_download_limit: u64,
+    /// The whole-object downloads in flight, so teardown can cancel them
+    /// instead of dropping them. See [`crate::fill`].
+    fills: Arc<FillTracker>,
 }
 
 impl MtpFs {
@@ -248,6 +301,7 @@ impl MtpFs {
             read_only,
             spool_dir,
             reconnect,
+            full_download_limit,
             unplug,
         } = config;
         Self {
@@ -271,6 +325,8 @@ impl MtpFs {
             read_only,
             fetch_counter: Arc::new(AtomicU64::new(0)),
             full_fill_counter: Arc::new(AtomicU64::new(0)),
+            full_download_limit,
+            fills: Arc::new(FillTracker::default()),
         }
     }
 
@@ -294,6 +350,52 @@ impl MtpFs {
     #[allow(dead_code)] // used by integration tests via lib.rs, not by the bin
     pub fn full_fill_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.full_fill_counter)
+    }
+
+    /// Drop an object's read cache once nothing holds the file open.
+    ///
+    /// A cache whose whole-object fill is still running stays: the transfer must
+    /// not be abandoned, and a reopen while it runs joins it instead of starting
+    /// a second download of the same object. That filler drops the entry itself
+    /// when it finishes. A cache with no fill running (every ranged read, and a
+    /// finished fill) goes right away, so reopening a file re-reads it from the
+    /// device rather than serving bytes of unknown age.
+    fn drop_read_cache_if_unused(inner: &mut Inner, inode: u64) {
+        if inner.fh_to_inode.values().any(|&open| open == inode) {
+            return;
+        }
+        if inner
+            .read_cache
+            .get(&inode)
+            .is_some_and(|cache| cache.is_filling())
+        {
+            return;
+        }
+        inner.read_cache.remove(&inode);
+    }
+
+    /// How an object of this size would be read on the device we're attached to.
+    fn read_strategy_for(&self, object_size: u64) -> ReadStrategy {
+        let supports_partial_download = self
+            .device
+            .lock()
+            .unwrap()
+            .capabilities()
+            .supports_partial_download;
+        read_strategy(
+            supports_partial_download,
+            object_size,
+            self.full_download_limit,
+        )
+    }
+
+    /// The mount's in-flight whole-object downloads.
+    ///
+    /// Whoever owns the mount takes this *before* handing the filesystem to
+    /// `fuser` and calls [`FillTracker::stop_and_wait`] after unmounting, so a
+    /// transfer is cancelled rather than dropped when the process goes away.
+    pub fn fills(&self) -> Arc<FillTracker> {
+        Arc::clone(&self.fills)
     }
 
     fn alloc_fh(&self) -> u64 {
@@ -845,9 +947,23 @@ impl MtpFs {
         }
     }
 
-    /// Start the one full-object filler owned by this cache generation.
+    /// Start the one whole-object filler owned by this cache generation.
+    ///
+    /// Opening the download blocks this thread while it waits for the device's
+    /// single MTP session, and it does so holding `inner`. That is deliberate:
+    /// `fuser::Config::default()` leaves `n_threads` at 1, so one event-loop
+    /// thread dispatches every callback anyway and releasing the lock earlier
+    /// would buy nothing. Raise `n_threads` first if you ever want to change it
+    /// (the same note applies to uploads and to the reconnect wait).
     fn ensure_full_fill_running(&self, inode: u64, cache: &Arc<SharedSparseCache>) {
         if !cache.start_fill() {
+            return;
+        }
+        if !self.fills.register(Arc::clone(cache)) {
+            cache.fail(FillFailure::new(
+                "the mount is going away, so no new whole-object download was started",
+                false,
+            ));
             return;
         }
 
@@ -866,24 +982,30 @@ impl MtpFs {
             Ok(download) => download,
             Err(error) => {
                 cache.fail(FillFailure::new(error.to_string(), is_link_lost(&error)));
+                self.fills.finished(cache);
                 return;
             }
         };
 
         self.full_fill_counter.fetch_add(1, Ordering::Relaxed);
         let cache = Arc::clone(cache);
+        let fills = Arc::clone(&self.fills);
+        let shared_inner = Arc::clone(&self.inner);
         self.rt.spawn(async move {
-            // Keep ownership of FileDownload in this task until EOF or an
-            // unavoidable stream error. Reader seeks, cancellation, and close
-            // only drop their Arc; none can drop this stream.
-            let stream = futures::stream::unfold(Some(download), |state| async move {
-                let mut download = state?;
-                download
-                    .next_chunk()
-                    .await
-                    .map(|chunk| (chunk, Some(download)))
-            });
-            fill_from_stream(cache, stream, is_link_lost).await;
+            // This task owns the FileDownload until end of transfer. A reader
+            // seek, an interrupted read(), and close() only drop their Arc on
+            // the cache; none of them can reach the stream. Only teardown can,
+            // and it cancels rather than drops (see `crate::fill`).
+            fill_from_stream(Arc::clone(&cache), FullObjectStream(download), is_link_lost).await;
+            fills.finished(&cache);
+
+            // The cache outlives the last close() while its fill is running, so
+            // the filler is the one that drops it once nothing holds the file
+            // open any more.
+            let mut inner = shared_inner.lock().unwrap();
+            if !inner.fh_to_inode.values().any(|&open| open == inode) {
+                inner.read_cache.remove(&inode);
+            }
         });
     }
 
@@ -996,19 +1118,22 @@ impl MtpFs {
                 if let Some(parent_ino) = inner.inodes.find_parent_by_handle(*handle) {
                     inner.dirs_loaded.remove(&parent_ino);
                 }
-                // Clear read cache entries for file handles pointing to this object.
-                let fhs_to_clear: Vec<u64> = inner
-                    .fh_to_inode
-                    .iter()
-                    .filter_map(|(&fh, &ino)| {
-                        inner.inodes.get(ino).and_then(|e| match &e.kind {
-                            InodeKind::File { handle: h } if *h == *handle => Some(fh),
-                            _ => None,
-                        })
+                // Drop the cached bytes for this object: they describe the
+                // file as it was. A fill still running keeps its own Arc, so it
+                // finishes into a cache nothing reads any more rather than being
+                // abandoned mid-transfer.
+                let stale: Vec<u64> = inner
+                    .read_cache
+                    .keys()
+                    .copied()
+                    .filter(|&ino| {
+                        inner.inodes.get(ino).is_some_and(
+                            |e| matches!(&e.kind, InodeKind::File { handle: h } if *h == *handle),
+                        )
                     })
                     .collect();
-                for fh in fhs_to_clear {
-                    inner.read_cache.remove(&fh);
+                for ino in stale {
+                    inner.read_cache.remove(&ino);
                 }
             }
             DeviceEvent::StoreAdded { .. }
@@ -1156,10 +1281,30 @@ impl Filesystem for MtpFs {
         reply.ok();
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let mut inner = self.inner.lock().unwrap();
         match inner.inodes.get(ino.0) {
             Some(entry) if !entry.is_dir() => {
+                // Refuse an unreadable object here rather than at the first
+                // read: `cp` would otherwise have created its destination file
+                // before finding out, and a sparse cache would have been
+                // allocated for bytes that are never coming.
+                //
+                // Write-only opens are none of this check's business. An
+                // overwrite replaces the object without reading a byte of it,
+                // and refusing that would make a big file unwritable too.
+                if flags.acc_mode() != OpenAccMode::O_WRONLY
+                    && self.read_strategy_for(entry.size) == ReadStrategy::TooLargeForSequentialFull
+                {
+                    error!(
+                        "Cannot read '{}': this device has no partial-read operation, so reading \
+                         it means holding the MTP session for the whole {} bytes, above the \
+                         --full-download-limit of {}. Raise the limit (0 lifts it) to allow it.",
+                        entry.name, entry.size, self.full_download_limit
+                    );
+                    reply.error(Errno::EFBIG);
+                    return;
+                }
                 let fh = self.alloc_fh();
                 inner.fh_to_inode.insert(fh, ino.0);
                 reply.opened(FileHandle(fh), FopenFlags::empty());
@@ -1219,10 +1364,12 @@ impl Filesystem for MtpFs {
             return;
         }
 
-        // Lazily create a sparse cache for this file handle.
+        // Lazily create the sparse cache for this object. Keyed by inode, so a
+        // second file descriptor on the same file joins the bytes (and, on the
+        // whole-object path, the one download) instead of starting its own.
         use std::collections::hash_map::Entry;
         let spool_dir = inner.spool_dir.clone();
-        let cache = match inner.read_cache.entry(fh_val) {
+        let cache = match inner.read_cache.entry(ino.0) {
             Entry::Occupied(slot) => Arc::clone(slot.get()),
             Entry::Vacant(slot) => {
                 let cache = match SharedSparseCache::new(entry.size, &spool_dir) {
@@ -1238,27 +1385,19 @@ impl Filesystem for MtpFs {
             }
         };
 
-        let supports_partial_download = self
-            .device
-            .lock()
-            .unwrap()
-            .capabilities()
-            .supports_partial_download;
-        let strategy = read_strategy(supports_partial_download, entry.size);
-        match strategy {
-            ReadStrategy::TooLargeForSequentialFull => {
-                error!(
-                    "Cannot read '{}': the responder has no partial-download operation and the \
-                     object is {} bytes, above the automatic full-download limit of {} bytes",
-                    entry.name, entry.size, FULL_DOWNLOAD_LIMIT
-                );
-                reply.error(Errno::EFBIG);
-                return;
-            }
-            ReadStrategy::SequentialFull => {}
-            ReadStrategy::Ranged => {}
+        let strategy = self.read_strategy_for(entry.size);
+        if strategy == ReadStrategy::TooLargeForSequentialFull {
+            // `open` already refuses this, so getting here means a descriptor
+            // that predates the object growing past the limit.
+            error!(
+                "Cannot read '{}': {} bytes is above the --full-download-limit of {} and this \
+                 device has no partial-read operation",
+                entry.name, entry.size, self.full_download_limit
+            );
+            reply.error(Errno::EFBIG);
+            return;
         }
-        if matches!(strategy, ReadStrategy::SequentialFull) {
+        if strategy == ReadStrategy::SequentialFull {
             // The filler owns only per-cache state and its FileDownload. Do not hold
             // Inner while waiting: the background task must be able to publish
             // chunks, and unrelated bookkeeping must remain accessible.
@@ -1334,7 +1473,24 @@ impl Filesystem for MtpFs {
                     }
                 };
                 let bytes_len = bytes.len() as u64;
-                if let Err(e) = cache.write_at(cursor, &bytes) {
+                // A responder may hand back more than it was asked for, and
+                // `mtp-rs` passes the response through as it arrived. Keep only
+                // what fits inside the object: the cache rejects a write past
+                // the advertised size, and turning a device quirk into an EIO on
+                // the last chunk of every file would be a poor trade.
+                let writable = usize::try_from(entry.size.saturating_sub(cursor))
+                    .unwrap_or(usize::MAX)
+                    .min(bytes.len());
+                if writable < bytes.len() {
+                    warn!(
+                        "Device returned {} bytes at offset {cursor} for '{}', past its advertised \
+                         size of {}; keeping the {writable} that fit",
+                        bytes.len(),
+                        entry.name,
+                        entry.size
+                    );
+                }
+                if let Err(e) = cache.write_at(cursor, &bytes[..writable]) {
                     error!("Sparse cache write failed: {e}");
                     reply.error(Errno::EIO);
                     return;
@@ -1384,8 +1540,9 @@ impl Filesystem for MtpFs {
             Ok(())
         };
 
-        inner.read_cache.remove(&fh_val);
-        inner.fh_to_inode.remove(&fh_val);
+        if let Some(inode) = inner.fh_to_inode.remove(&fh_val) {
+            Self::drop_read_cache_if_unused(&mut inner, inode);
+        }
 
         // A failed flush means the bytes never reached the device, so `close()`
         // has to say so instead of pretending the write worked.
@@ -1926,25 +2083,41 @@ mod tests {
         assert!(futures::executor::block_on(stream.next()).is_none());
     }
 
+    const LIMIT: u64 = DEFAULT_FULL_DOWNLOAD_LIMIT;
+
     #[test]
     fn partial_capability_always_keeps_the_ranged_path() {
-        assert_eq!(read_strategy(true, 1), ReadStrategy::Ranged);
+        assert_eq!(read_strategy(true, 1, LIMIT), ReadStrategy::Ranged);
         assert_eq!(
-            read_strategy(true, FULL_DOWNLOAD_LIMIT + 1),
+            read_strategy(true, LIMIT + 1, LIMIT),
             ReadStrategy::Ranged,
-            "the full-download bound must not affect DBI/Android-style responders"
+            "the whole-object bound must not affect DBI/Android-style responders"
         );
     }
 
     #[test]
     fn no_partial_capability_uses_a_bounded_sequential_fill() {
         assert_eq!(
-            read_strategy(false, FULL_DOWNLOAD_LIMIT),
+            read_strategy(false, LIMIT, LIMIT),
+            ReadStrategy::SequentialFull,
+            "an object exactly at the limit is still allowed"
+        );
+        assert_eq!(
+            read_strategy(false, LIMIT + 1, LIMIT),
+            ReadStrategy::TooLargeForSequentialFull
+        );
+    }
+
+    #[test]
+    fn a_zero_limit_lifts_the_ceiling_entirely() {
+        assert_eq!(
+            read_strategy(false, u64::MAX, 0),
             ReadStrategy::SequentialFull
         );
         assert_eq!(
-            read_strategy(false, FULL_DOWNLOAD_LIMIT + 1),
-            ReadStrategy::TooLargeForSequentialFull
+            read_strategy(false, u64::MAX, 1),
+            ReadStrategy::TooLargeForSequentialFull,
+            "0 means no limit; every other value is a real ceiling"
         );
     }
 }

@@ -38,7 +38,8 @@ use log::{debug, error, info, warn};
 
 use crate::daemon::unmount::{force_unmount, wait_until_unmounted};
 use crate::device::{DeviceOpener, UnplugSwitch};
-use crate::fs::{MtpFs, MtpFsConfig};
+use crate::fill::{FillTracker, DEFAULT_STOP_TIMEOUT};
+use crate::fs::{MtpFs, MtpFsConfig, DEFAULT_FULL_DOWNLOAD_LIMIT};
 use crate::hints::open_failure_hint;
 use crate::reconnect::ReconnectPolicy;
 
@@ -104,6 +105,9 @@ pub struct SupervisorConfig {
     pub read_only: bool,
     /// How long to wait for a mount to actually leave the filesystem.
     pub unmount_timeout: Duration,
+    /// Ceiling on the whole-object read fallback, in bytes (`0` lifts it).
+    /// See [`DEFAULT_FULL_DOWNLOAD_LIMIT`].
+    pub full_download_limit: u64,
 }
 
 impl SupervisorConfig {
@@ -114,6 +118,7 @@ impl SupervisorConfig {
             spool_dir,
             read_only,
             unmount_timeout: DEFAULT_UNMOUNT_TIMEOUT,
+            full_download_limit: DEFAULT_FULL_DOWNLOAD_LIMIT,
         }
     }
 }
@@ -125,6 +130,9 @@ struct ActiveMount {
     session: fuser::BackgroundSession,
     /// Tells the give-up watcher to stop, so it doesn't outlive the mount.
     watcher_stop: Arc<AtomicBool>,
+    /// This mount's in-flight whole-object downloads, so taking it down cancels
+    /// them instead of dropping them. See [`crate::fill`].
+    fills: Arc<FillTracker>,
 }
 
 /// Mounts devices as they arrive and unmounts them as they leave.
@@ -243,6 +251,7 @@ impl Supervisor {
                 // between. Turning this on would trade a mount that reappears
                 // for a desktop that hangs.
                 reconnect: ReconnectPolicy::from_secs(0),
+                full_download_limit: self.config.full_download_limit,
                 // The pretend cable is a test seam for the CLI's reconnect path;
                 // nothing here ever flips it.
                 unplug: UnplugSwitch::default(),
@@ -250,6 +259,7 @@ impl Supervisor {
         );
 
         let shutdown = mtp_fs.shutdown();
+        let fills = mtp_fs.fills();
         let mut fuse_config = fuser::Config::default();
         fuse_config.mount_options = mtp_fs.mount_options();
 
@@ -289,6 +299,7 @@ impl Supervisor {
                 label: ident.label,
                 session,
                 watcher_stop,
+                fills,
             },
         );
     }
@@ -303,6 +314,7 @@ impl Supervisor {
             label,
             session,
             watcher_stop,
+            fills,
         } = mount;
         watcher_stop.store(true, Ordering::Relaxed);
         info!("Unmounting {label} from {}: {reason}", path.display());
@@ -323,6 +335,19 @@ impl Supervisor {
         // the next device's mount is queued behind this loop.
         if let Err(e) = force_unmount(&path) {
             error!("Can't unmount {}: {e}", path.display());
+        }
+
+        // A whole-object read holds the device's MTP session for the whole
+        // transfer, and dropping one mid-flight leaves the responder in the
+        // middle of a USB transaction. Cancelling is bounded (a round-trip, or
+        // the timeout when the cable is already out), so it can't hold the loop
+        // for the length of a download the way waiting for one would.
+        if !fills.stop_and_wait(DEFAULT_STOP_TIMEOUT) {
+            warn!(
+                "A download from {label} was still finishing after {}s; \
+                 the device may need a moment before it answers again.",
+                DEFAULT_STOP_TIMEOUT.as_secs()
+            );
         }
         let joining_path = path.clone();
         std::thread::spawn(move || match session.umount_and_join() {

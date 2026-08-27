@@ -27,7 +27,9 @@ src/
   buffer.rs        # Write buffer: temp-file-backed, flushes to MTP on close
   device.rs        # DeviceOpener trait (how the mount (re)opens its device) + UnplugSwitch
   reconnect.rs     # ReconnectPolicy: the timeout window and its backoff schedule
-  shutdown.rs      # One-way "take this mount down" signal
+  shutdown.rs      # One-way "take this mount down" signal + the SIGTERM/SIGINT handler
+  fill.rs          # FillTracker: the whole-object downloads in flight, and cancelling them
+  size.rs          # Parses/formats the byte sizes --full-download-limit takes
   hints.rs         # Remedies for device-open failures, shared with --help
   spool.rs         # Resolves and prepares the disk-backed spool directory
   daemon/          # The mtp-mountd half (see "The daemon" below)
@@ -61,7 +63,7 @@ mtp-rs (MtpDevice, Storage + next_event)
 **Entry point:** `main.rs` parses CLI args, opens the MTP device via `mtp-rs`, and starts the FUSE session via `fuser`.
 
 **Key design choices:**
-- **Reads** use one `SharedSparseCache` per open file handle, with `SparseCache` (tempfile + sorted `Vec<Range<u64>>` of populated ranges) remaining the authority for which bytes are valid. Partial-capable responders use `Storage::read_range` in 1 MiB chunks exactly as before. A responder with neither partial-download operation gets one capability-gated `Storage::download(ByteRange::Full)` filler for objects up to `FULL_DOWNLOAD_LIMIT` (4 GiB): the task owns `FileDownload` through EOF, publishes chunks after disk writes, and wakes range waiters. Seeks and `release` must never cancel or restart a healthy filler; only unavoidable link loss may start a new-session retry. Above the bound, return `EFBIG` before opening a stream.
+- **Reads** go through one `SharedSparseCache` per open *object* (keyed by inode, not by file handle), with `SparseCache` (tempfile + sorted `Vec<Range<u64>>` of populated ranges) as the authority for which bytes are real. Partial-capable responders fetch missing ranges via `Storage::read_range` in 1 MiB chunks. A responder with neither partial-download operation takes the whole-object fallback instead. See "Reading without partial reads" below.
 - **Writes** buffer to a temp file in the spool dir, flushed to MTP on `release`. The flush hands `Storage::upload` a
   lazy stream over the spool file (`fs::file_stream`, 64 KiB per chunk), so an upload holds one chunk in memory
   regardless of file size. Don't collect those chunks into a `Vec` first: that puts the whole file back in RAM, which
@@ -72,6 +74,80 @@ mtp-rs (MtpDevice, Storage + next_event)
 - **Locking:** single `Arc<Mutex<Inner>>` serializes all FUSE callbacks. Shared with the event monitor task. Acceptable because fuser already serializes per-mount: `fuser::Config::default()` leaves `n_threads` at 1, so one event-loop thread dispatches every request and doesn't read the next one until the current callback returns. That's why dropping the lock around a long upload would buy nothing today; if you ever want concurrent callbacks, raise `n_threads` first (Linux only in fuser 0.17), and only then does the lock's scope matter.
 - **Event monitoring:** A background tokio task polls `MtpDevice::next_event()` on a cloned device handle (cheap, Arc-backed). On `ObjectAdded`/`ObjectRemoved`/`ObjectInfoChanged` events, it invalidates the relevant directory's cache entry in `dirs_loaded`. For unknown objects (newly added on device), it invalidates all directories. Each loop belongs to one session (`event_epoch`); a reconnect bumps the epoch and the old loop exits on its next tick.
 - **Reconnect:** the mount survives a device that disconnects and comes back. See "Surviving a disconnect" below.
+
+## Reading without partial reads
+
+Some responders handle neither `GetPartialObject` nor `GetPartialObject64`: libhaze (Sphaira on the
+Nintendo Switch) is the one that turned this up (#9), and simple PTP responders are the same. There is
+no way to ask them for a byte range, so `Storage::read_range` fails `Unsupported` and every read of
+every file used to be an `EIO`.
+
+**The fallback.** `read_strategy(supports_partial_download, object_size, limit)` picks the path per
+object. Without a partial-read op, the first `read()` starts ONE `Storage::download(ByteRange::Full)`
+whose chunks are written into the same `SharedSparseCache` the ranged path uses, and each blocked read
+returns the moment its own bytes land. `SparseCache` stays the authority, so a stream that dies at 60%
+just leaves the rest unpopulated: a read is only ever served from bytes the device actually sent, never
+from the tempfile's zero-filled hole. There is no promotion step to get wrong.
+
+**Nothing a reader does may interrupt the fill.** A seek that jumps ahead waits for the running stream
+rather than restarting it, and `close()` doesn't stop it either. Restarting would throw away the walk
+and, worse, mean dropping a live `FileDownload`: `mtp-rs` marks that type `#[must_use]` because an
+abandoned transfer leaves the responder mid-USB-transaction, which on Android is the failure that needs
+a physical replug. The one thing that MAY stop a fill is the mount going away, and it cancels rather
+than drops (see "Taking a mount down mid-transfer").
+
+**The cache is keyed by inode so one object is downloaded once.** A thumbnailer or `file` does
+open → read the header → close → reopen, and two processes reading one file overlap; with a per-handle
+cache each of those is another multi-minute download of the same object. `drop_read_cache_if_unused`
+therefore keeps the entry while any fh still maps to the inode **or** a fill is still running (the
+filler drops it itself when it finishes). Once nothing holds it and no fill is running the entry goes,
+so reopening a file later re-reads it from the device instead of serving bytes of unknown age. That's
+deliberately not a cache with a policy: see "Things to avoid".
+
+**Link loss, but not stale handles.** A fill that fails with a link-lost error may be retried once on a
+new session (`recover_full_fill_link` + `reset_after_link_loss`, one retry). Nothing else resets a
+fill, which is what stops a seek or a `close()` from restarting a healthy one.
+
+**The size bound and why it's a bound, not a ban.** A fill holds the device's single MTP session for
+the whole transfer, and with `fuser`'s one event-loop thread every other process on the mount queues
+behind it, so a background thumbnailer that opens a 30 GB file freezes the mount for a quarter of an
+hour. No number avoids that (1 GiB over a 20 MiB/s link is already ~50 seconds), so
+`DEFAULT_FULL_DOWNLOAD_LIMIT` (4 GiB) caps the damage rather than preventing it, and
+`--full-download-limit` (`0` lifts it) is how someone who *means* to copy a 32 GB Switch dump gets it.
+Without the escape hatch the tool can't do its main job on the device that motivated the feature. Same
+shape as `ReconnectPolicy::DEFAULT_TIMEOUT_SECS`: conservative default, opt in when you know what
+you're waiting for.
+
+**`EFBIG` lands on `open`, not on `read`.** Refusing at the first read would mean `cp` had already
+created its destination file, and a sparse tempfile had already been allocated, for bytes that are
+never coming. `open` only applies the check when the open asks for read access: an overwrite replaces
+the object without reading a byte of it, so a write-only open of a huge file must still succeed.
+
+**A device that over-returns doesn't break the ranged path.** `SparseCache::write_at` rejects a write
+past the advertised size (a real invariant: it's what stops a short read from being served as zeros),
+and `mtp-rs` passes a device's response through as it arrived. The ranged path therefore clamps to the
+object size and warns, the same way `fill_from_stream` does, instead of turning a device quirk into an
+`EIO` on the last chunk of every file.
+
+## Taking a mount down mid-transfer
+
+A whole-object fill can be minutes long, and the process may be asked to stop in the middle of one.
+Dropping the `FileDownload` then is the mid-transaction abort described above, and dropping the tokio
+runtime the fill was spawned on does exactly that, silently. So teardown is explicit:
+
+- `MtpFs::fills()` hands out the `FillTracker` (`fill.rs`), which holds every live fill. Take it
+  *before* the filesystem goes to `fuser`, which consumes it.
+- `FillTracker::stop_and_wait(DEFAULT_STOP_TIMEOUT)` sets a flag every filler checks between chunks;
+  the filler calls `FileDownload::cancel` (a bounded drain, a round-trip rather than a transfer) and
+  exits. It also refuses to register new fills, so nothing starts during teardown.
+- `main` calls it after `umount_and_join` and before the runtime drops; the daemon's `Supervisor`
+  calls it in `unmount`, after `force_unmount`. Both are bounded: a device that's physically gone
+  won't answer the cancel, and blocking an unmount on it would be worse than the untidy exit.
+
+This is also why `mtp-mount` catches SIGINT/SIGTERM at all (`shutdown::spawn_signal_handler`, shared
+with the daemon). It used to let Ctrl+C kill the process where it stood, which is fine when every read
+is a 1 MB transaction and not fine when one holds the session for 30 GB. The `--help` text has always
+said "Press Ctrl+C to unmount"; now that's what happens.
 
 ## Surviving a disconnect
 
@@ -194,8 +270,9 @@ notices a dead session on its next operation, the USB watch only on its next pol
 
 ## Testing
 
-- **Library unit tests** (111): inode table, write buffer, sparse cache and sequential-fill coordination, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal, mount-root resolution, device directory naming, mountpoint detection, stale-mount sweep, dry-run key derivation. Run with `cargo test --lib`.
-- **Integration tests** (29): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring, partial reads, reconnects, and re-keyed handles. Linux only (needs `libfuse3-dev`), except the one non-ignored test below. Run with `cargo test --test integration -- --ignored --test-threads=1`
+- **Library unit tests** (124): inode table, write buffer, sparse cache and sequential-fill coordination, fill tracking and cancellation, size parsing, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal, mount-root resolution, device directory naming, mountpoint detection, stale-mount sweep, dry-run key derivation. Run with `cargo test --lib`.
+- **Binary tests** (3 for `mtp-mount`, 2 for `mtp-mountd`): the clap definitions are well-formed and `--help`'s `4G` default parses back to `DEFAULT_FULL_DOWNLOAD_LIMIT`, so the help text can't drift from what the mount does. `cargo test --bins`.
+- **Integration tests** (35): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring, partial reads, reconnects, re-keyed handles, and the whole-object fallback. Linux only (needs `libfuse3-dev`), except the one non-ignored test below. Run with `cargo test --test integration -- --ignored --test-threads=1`
 - **Daemon tests** (8, `tests/daemon.rs`): drive `Supervisor` through its command channel and assert against the real filesystem. Linux only, `cargo test --test daemon -- --ignored --test-threads=1`. See below.
 - **Dry-run tests** (7, `tests/dry_run.rs`): inject arrivals and departures into the `--dry-run` reporter and assert on the verdict, the wording a person reads, and that a run leaves a temp mount root untouched. No FUSE, no device, so they run everywhere with plain `cargo test`.
 
@@ -204,6 +281,26 @@ notices a dead session on its next operation, the USB watch only on its next pol
 `mtp-rs` can't simulate one. `unregister_virtual_device` only removes a device from the *discovery* registry: an already-open `MtpDevice` keeps its transport and backing dir and answers as if nothing happened (pinned down by `test_unregistering_a_virtual_device_does_not_disconnect_an_open_one`, the one test in that file that isn't `#[ignore]`). So the seam is `device::UnplugSwitch`, an `Arc<AtomicBool>` the mount and the `DeviceOpener` share: while it's set, every MTP op fails `Disconnected` and reopening fails too. Production never flips it.
 
 The other trap is that the virtual device numbers handles from 1 in listing order, so a reopened device hands out the *same* handles and a mount that never re-resolved anything would still read the right bytes. The reconnect fixture defeats that with a decoy "Handle burner" storage: on every reopen the test's opener lists it first, burning 64 handles, so the real files come back with handles that can't collide with the dead session's. `test_open_fd_survives_reconnect` is the test that actually pins the re-resolution down (verified: it fails, reading zeros, if `bump_generation` is removed).
+
+### Testing the whole-object fallback
+
+`MountSpec::no_partial_read` builds the virtual device with `supports_partial_object` and
+`supports_partial_object_64` both `false` (mtp-rs 0.31), which is what makes any of this testable
+without a Switch: the capability probe reports no partial download, ranged reads fail `Unsupported`,
+and `mtp-rs` *refuses* the operations rather than serving them anyway. `TestMount::no_partial_read`
+also takes the `--full-download-limit`, so a small file can stand in for one that's over the bound.
+
+`full_fill_count()` is the assertion that matters in most of these: it counts whole-object downloads
+started, so "one download, not one per read" and "a second descriptor doesn't re-download" are checks
+on a number rather than on timing. Don't reach for wall-clock assertions here. The virtual device
+streams from local disk at memory speed, so anything phrased as "while the download is still running"
+is a race that passes on hardware and fails in CI (one earlier version of the shared-cache test did
+exactly that; it's now two descriptors open at once, which is deterministic).
+
+One more trap: FUSE `release` is fire-and-forget, and the upload happens there. A test that writes
+through the mount and then reads the *backing directory* has to make one more call through the mount
+first (`fs::metadata`, say) to order itself after the release, because `fuser` dispatches on a single
+thread.
 
 ### Testing the daemon
 
@@ -249,11 +346,14 @@ is gone (verified by reverting the fix, which fails that test with `EIO`).
 
 - **Minimal**: correct POSIX subset, not everything
 - **No data loss**: safe flush sequence protects against upload failures
-- **Well-tested**: 143 tests, virtual device integration, no hardware needed
+- **Well-tested**: 178 tests, virtual device integration, no hardware needed
 
 ## Things to avoid
 
-- Complex caching strategies
+- Complex caching strategies. Sharing one cache between the descriptors on an open object is not one:
+  it exists so a device is never asked for the same object twice at once, and the entry still goes as
+  soon as nothing holds the file open. A cache that outlives the last `close()` would need an eviction
+  policy and a staleness story, and that's the line.
 - Extended attributes, ACLs, or permission mapping
 - Hardlinks, symlinks (MTP doesn't support them)
 
@@ -265,8 +365,15 @@ is gone (verified by reverting the fix, which fails that test with `EIO`).
 
 The `--help` output includes examples, troubleshooting tips, and notes about MTP
 limitations. It's an important part of the user experience. When adding or changing
-CLI flags, update the `after_long_help` text in `main.rs` to match. The short `-h`
-output is auto-generated by clap; the long `--help` has hand-written sections.
+CLI flags, update the `after_long_help` text in `main.rs` to match (and in
+`bin/mtp-mountd.rs` for the daemon's own). The short `-h` output is auto-generated
+by clap; the long `--help` has hand-written sections.
+
+`--full-download-limit` exists on both binaries and takes a size (`8G`, `512M`, a
+plain byte count, or `0` for no limit) through `size::parse_size`. Its clap default
+is the string `"4G"` so the help reads well; a unit test in each binary asserts that
+string parses back to `DEFAULT_FULL_DOWNLOAD_LIMIT`, which is what stops the help
+text from drifting away from the constant the code uses.
 
 ## Code style
 

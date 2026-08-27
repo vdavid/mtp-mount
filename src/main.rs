@@ -1,11 +1,13 @@
 mod buffer;
 mod device;
 mod error;
+mod fill;
 mod fs;
 mod hints;
 mod inode;
 mod reconnect;
 mod shutdown;
+mod size;
 mod sparse_cache;
 mod spool;
 
@@ -16,9 +18,16 @@ use std::time::Duration;
 use clap::Parser;
 
 use crate::device::{UnplugSwitch, UsbOpener};
-use crate::fs::{MtpFs, MtpFsConfig};
+use crate::fill::DEFAULT_STOP_TIMEOUT;
+use crate::fs::{MtpFs, MtpFsConfig, DEFAULT_FULL_DOWNLOAD_LIMIT};
 use crate::hints::{indent, open_failure_hint, BUSY_HINT, PERMISSION_HINT};
 use crate::reconnect::ReconnectPolicy;
+use crate::shutdown::{spawn_signal_handler, Shutdown};
+use crate::size::{format_size, parse_size};
+
+/// The default for `--full-download-limit`, spelled the way `--help` should show
+/// it. `default_value_parser_matches_the_constant` keeps it honest.
+const DEFAULT_FULL_DOWNLOAD_LIMIT_ARG: &str = "4G";
 
 /// Mount MTP devices as local filesystems via FUSE.
 ///
@@ -57,6 +66,10 @@ struct Cli {
     /// Seconds to wait for a disconnected device to come back (default 0: unmount right away)
     #[arg(long, value_name = "SECONDS", default_value_t = ReconnectPolicy::DEFAULT_TIMEOUT_SECS)]
     reconnect_timeout: u64,
+
+    /// Largest file to read from a device with no partial-read support, e.g. 8G (0 for no limit)
+    #[arg(long, value_name = "SIZE", value_parser = parse_size, default_value = DEFAULT_FULL_DOWNLOAD_LIMIT_ARG)]
+    full_download_limit: u64,
 }
 
 /// The hand-written `--help` sections.
@@ -85,6 +98,10 @@ EXAMPLES:
     Give a worn-out cable a minute to recover (0 unmounts on the first drop):
         mtp-mount --reconnect-timeout 60 /mnt/phone
 
+    Copy a file bigger than {limit} off a device with no partial-read support
+    (0 removes the limit entirely):
+        mtp-mount --full-download-limit 32G /mnt/switch
+
     Show debug output (handy for troubleshooting):
         RUST_LOG=debug mtp-mount /mnt/phone
 
@@ -105,6 +122,15 @@ NOTES:
     directory (--spool-dir overrides it), so uploads bigger than RAM work.
     MTP doesn't support partial writes, hardlinks, symlinks, or chmod.
 
+    Most devices can hand over a byte range, so reading a file fetches only the
+    part you touch. A few (some Nintendo Switch MTP apps, simple PTP responders)
+    can only send whole objects. There, the first read starts one whole-file
+    download and later reads wait for their bytes to arrive; nothing you do to
+    the file interrupts it. That download holds the device for its whole length
+    and everything else on the mount waits behind it, so files above
+    --full-download-limit (default {limit}) are refused with \"File too large\"
+    instead. Raise it, or pass 0, when you mean to copy a big one.
+
     If the device disconnects, the mount is taken down. Pass
     --reconnect-timeout SECONDS to wait for it to come back instead: the mount
     then picks up where it left off, including files you have open. Useful with
@@ -114,6 +140,7 @@ NOTES:
     returns or the window ends.",
         busy = indent(BUSY_HINT, "        "),
         permission = indent(PERMISSION_HINT, "        "),
+        limit = format_size(DEFAULT_FULL_DOWNLOAD_LIMIT),
     )
 }
 
@@ -225,10 +252,12 @@ fn main() {
             read_only: cli.read_only,
             spool_dir,
             reconnect: ReconnectPolicy::from_secs(cli.reconnect_timeout),
+            full_download_limit: cli.full_download_limit,
             unplug,
         },
     );
     let shutdown = mtp_fs.shutdown();
+    let fills = mtp_fs.fills();
     let mount_options = mtp_fs.mount_options();
 
     let mut config = fuser::Config::default();
@@ -247,22 +276,50 @@ fn main() {
 
     println!("Mounted. Press Ctrl+C to unmount.");
 
-    // Either the filesystem gives up on the device, or the mount ends the
-    // normal way (`umount`, or the kernel tearing the session down).
-    let gave_up = loop {
-        if shutdown.wait_timeout(Duration::from_millis(250)).is_some() {
-            break true;
+    // Ctrl+C has to come through here rather than kill the process where it
+    // stands. A whole-object read holds the device's MTP session for the entire
+    // transfer, and a process that dies mid-transfer leaves the responder in the
+    // middle of a USB transaction; on Android that's the failure that needs a
+    // physical replug. Catching the signal is what buys the chance to cancel.
+    let signalled = Arc::new(Shutdown::default());
+    spawn_signal_handler(rt.handle(), {
+        let signalled = Arc::clone(&signalled);
+        move |name| {
+            println!("\nGot {name}, unmounting...");
+            signalled.request(name);
         }
-        if session.guard.is_finished() {
-            break false;
-        }
-    };
+    });
 
-    let ended = if gave_up {
+    // Either the filesystem gives up on the device, the person asks us to stop,
+    // or the mount ends the normal way (`umount`, or the kernel tearing the
+    // session down).
+    let mut gave_up = false;
+    loop {
+        if shutdown.wait_timeout(Duration::from_millis(250)).is_some() {
+            gave_up = true;
+            break;
+        }
+        if signalled.is_requested() || session.guard.is_finished() {
+            break;
+        }
+    }
+
+    let ended = if gave_up || signalled.is_requested() {
         session.umount_and_join()
     } else {
         session.join()
     };
+
+    // Now that nothing new can arrive, tell any whole-object download in flight
+    // to cancel, and give it a moment to actually do so before the runtime it
+    // lives on goes away. Dropping the runtime with a transfer live is the
+    // silent mid-transaction abort this is here to prevent.
+    if !fills.stop_and_wait(DEFAULT_STOP_TIMEOUT) {
+        eprintln!(
+            "A download was still finishing when we stopped waiting; \
+             the device may need a moment before it answers again."
+        );
+    }
 
     if let Err(e) = ended {
         eprintln!("Mount ended with an error: {e}");
@@ -270,5 +327,36 @@ fn main() {
     }
     if gave_up {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_cli_definition_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn default_value_parser_matches_the_constant() {
+        // `--help` shows "4G" while the code reasons in bytes. If those two ever
+        // disagree, the help text lies about what the mount actually does.
+        assert_eq!(
+            parse_size(DEFAULT_FULL_DOWNLOAD_LIMIT_ARG),
+            Ok(DEFAULT_FULL_DOWNLOAD_LIMIT)
+        );
+        let cli = Cli::parse_from(["mtp-mount", "/mnt/phone"]);
+        assert_eq!(cli.full_download_limit, DEFAULT_FULL_DOWNLOAD_LIMIT);
+    }
+
+    #[test]
+    fn the_limit_accepts_a_size_and_a_zero() {
+        let cli = Cli::parse_from(["mtp-mount", "--full-download-limit", "32G", "/mnt/switch"]);
+        assert_eq!(cli.full_download_limit, 32 * 1024 * 1024 * 1024);
+        let cli = Cli::parse_from(["mtp-mount", "--full-download-limit", "0", "/mnt/switch"]);
+        assert_eq!(cli.full_download_limit, 0);
     }
 }

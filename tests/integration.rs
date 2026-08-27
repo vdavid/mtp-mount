@@ -19,7 +19,7 @@ use mtp_rs::transport::virtual_device::config::{VirtualDeviceConfig, VirtualStor
 use tempfile::TempDir;
 
 use mtp_mount::device::{DeviceOpener, UnplugSwitch};
-use mtp_mount::fs::{MtpFs, MtpFsConfig};
+use mtp_mount::fs::{MtpFs, MtpFsConfig, DEFAULT_FULL_DOWNLOAD_LIMIT};
 use mtp_mount::reconnect::ReconnectPolicy;
 use mtp_mount::shutdown::Shutdown;
 
@@ -35,6 +35,12 @@ struct MountSpec {
     /// Add the decoy storage the reconnect tests need. Off by default so the
     /// other tests keep seeing a single storage in the mount root.
     handle_burner: bool,
+    /// Model a responder that handles neither partial-read operation (libhaze on
+    /// the Nintendo Switch, simple PTP responders), so reads take the
+    /// whole-object fallback instead of `Storage::read_range`.
+    no_partial_read: bool,
+    /// Ceiling on the whole-object fallback, in bytes (`0` lifts it).
+    full_download_limit: u64,
 }
 
 impl Default for MountSpec {
@@ -43,6 +49,8 @@ impl Default for MountSpec {
             watch_events: false,
             reconnect_secs: ReconnectPolicy::DEFAULT_TIMEOUT_SECS,
             handle_burner: false,
+            no_partial_read: false,
+            full_download_limit: DEFAULT_FULL_DOWNLOAD_LIMIT,
         }
     }
 }
@@ -126,6 +134,20 @@ impl TestMount {
         Self::build(setup, MountSpec::default())
     }
 
+    /// A mount over a responder that handles neither partial-read operation, so
+    /// every read goes through the whole-object fallback. `limit` is the
+    /// `--full-download-limit` in bytes (`0` lifts it).
+    fn no_partial_read<F: FnOnce(&Path)>(limit: u64, setup: F) -> Self {
+        Self::build(
+            setup,
+            MountSpec {
+                no_partial_read: true,
+                full_download_limit: limit,
+                ..Default::default()
+            },
+        )
+    }
+
     /// A mount whose device can be unplugged, with the given reconnect window.
     fn reconnectable<F: FnOnce(&Path)>(reconnect_secs: u64, setup: F) -> Self {
         Self::build(
@@ -174,11 +196,12 @@ impl TestMount {
             serial: serial.clone(),
             storages,
             // Stated even though they match the defaults: both are load-bearing here. Reads go
-            // through `Storage::read_range`, so the device must offer a partial-read op, and
-            // `test_rename_file` needs rename support. If a default ever flips, this suite should
-            // keep testing what it means to test.
+            // through `Storage::read_range` unless a test asks otherwise, so the device must offer
+            // a partial-read op, and `test_rename_file` needs rename support. If a default ever
+            // flips, this suite should keep testing what it means to test.
             supports_rename: true,
-            supports_partial_object_64: true,
+            supports_partial_object: !spec.no_partial_read,
+            supports_partial_object_64: !spec.no_partial_read,
             event_poll_interval: if spec.watch_events {
                 Duration::from_millis(50)
             } else {
@@ -210,6 +233,7 @@ impl TestMount {
                 read_only: false,
                 spool_dir: std::env::temp_dir(),
                 reconnect: ReconnectPolicy::from_secs(spec.reconnect_secs),
+                full_download_limit: spec.full_download_limit,
                 unplug: unplug.clone(),
             },
         );
@@ -1094,3 +1118,201 @@ fn test_stale_handle_does_not_reopen_the_device() {
 // the virtual device's ObjectInfo builder truncates size to u32::MAX.
 // The >4GB path (GetPartialObject64 with 64-bit offsets) was validated end-to-end
 // on a real Pixel 9 Pro XL with an 8 GB MKV via mtp-rs's examples/test_partial_download_64.rs.
+
+// ---------------------------------------------------------------------------
+// Reading from a responder with no partial-read operation
+//
+// libhaze (Sphaira on the Nintendo Switch) and simple PTP responders handle
+// neither `GetPartialObject` nor `GetPartialObject64`, so the only way to read
+// an object is to ask for all of it. The virtual device models that with
+// `supports_partial_object*: false`, which is what makes any of this testable
+// off hardware.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn test_no_partial_read_device_serves_files_through_one_whole_object_download() {
+    const FILE_SIZE: usize = 3 * 1024 * 1024;
+    let mount = TestMount::no_partial_read(DEFAULT_FULL_DOWNLOAD_LIMIT, |backing| {
+        let data: Vec<u8> = (0..FILE_SIZE).map(|i| pattern_byte(i as u64)).collect();
+        fs::write(backing.join("whole.bin"), data).unwrap();
+    });
+
+    let path = mount.storage_path().join("whole.bin");
+    let content = fs::read(&path).expect("read failed");
+    assert_eq!(content.len(), FILE_SIZE);
+    assert_eq!(content, pattern_bytes(0, FILE_SIZE));
+
+    assert_eq!(
+        mount.fetch_count(),
+        0,
+        "a device with no partial-read op must never reach Storage::read_range"
+    );
+    assert_eq!(
+        mount.full_fill_count(),
+        1,
+        "the whole file comes from ONE download, not one per read"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_a_far_read_waits_for_the_same_stream_rather_than_starting_another() {
+    const FILE_SIZE: usize = 4 * 1024 * 1024;
+    let mount = TestMount::no_partial_read(DEFAULT_FULL_DOWNLOAD_LIMIT, |backing| {
+        let data: Vec<u8> = (0..FILE_SIZE).map(|i| pattern_byte(i as u64)).collect();
+        fs::write(backing.join("seek.bin"), data).unwrap();
+    });
+
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let path = mount.storage_path().join("seek.bin");
+    let mut file = fs::File::open(&path).expect("open failed");
+
+    // A read near the start, then one at 75% of the file. Restarting the stream
+    // for the far read would mean a second download; waiting for the running one
+    // is the whole point.
+    let mut head = vec![0u8; 65536];
+    file.read_exact(&mut head).expect("head read failed");
+    assert_eq!(head, pattern_bytes(0, 65536));
+
+    let far = (FILE_SIZE as u64 * 3) / 4;
+    file.seek(SeekFrom::Start(far)).expect("seek failed");
+    let mut tail = vec![0u8; 65536];
+    file.read_exact(&mut tail).expect("far read failed");
+    assert_eq!(tail, pattern_bytes(far, 65536));
+
+    assert_eq!(
+        mount.full_fill_count(),
+        1,
+        "a seek must not restart or duplicate the whole-object download"
+    );
+}
+
+#[test]
+#[ignore]
+fn test_two_descriptors_on_one_file_share_a_single_whole_object_download() {
+    const FILE_SIZE: usize = 6 * 1024 * 1024;
+    let mount = TestMount::no_partial_read(DEFAULT_FULL_DOWNLOAD_LIMIT, |backing| {
+        let data: Vec<u8> = (0..FILE_SIZE).map(|i| pattern_byte(i as u64)).collect();
+        fs::write(backing.join("shared.bin"), data).unwrap();
+    });
+
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let path = mount.storage_path().join("shared.bin");
+
+    // Two readers of the same file, the way a thumbnailer and a copy overlap.
+    // The cache is keyed by inode, so the second descriptor joins the first's
+    // download instead of asking the device for the object a second time.
+    let mut first = fs::File::open(&path).expect("open failed");
+    let mut head = vec![0u8; 4096];
+    first.read_exact(&mut head).expect("read failed");
+    assert_eq!(head, pattern_bytes(0, 4096));
+
+    let mut second = fs::File::open(&path).expect("second open failed");
+    let far = FILE_SIZE as u64 - 4096;
+    second.seek(SeekFrom::Start(far)).expect("seek failed");
+    let mut tail = vec![0u8; 4096];
+    second.read_exact(&mut tail).expect("tail read failed");
+    assert_eq!(tail, pattern_bytes(far, 4096));
+
+    assert_eq!(
+        mount.full_fill_count(),
+        1,
+        "a second descriptor on the same file must not re-download the object"
+    );
+
+    // And the first descriptor still reads correctly from the shared cache.
+    first.seek(SeekFrom::Start(far)).expect("seek failed");
+    let mut same_tail = vec![0u8; 4096];
+    first.read_exact(&mut same_tail).expect("re-read failed");
+    assert_eq!(same_tail, tail);
+    assert_eq!(mount.full_fill_count(), 1);
+}
+
+#[test]
+#[ignore]
+fn test_a_file_above_the_limit_is_refused_at_open_with_efbig() {
+    const FILE_SIZE: usize = 1024 * 1024;
+    // A limit below the file's size, so the file we write is "too large".
+    let mount = TestMount::no_partial_read(FILE_SIZE as u64 - 1, |backing| {
+        fs::write(backing.join("huge.bin"), vec![7u8; FILE_SIZE]).unwrap();
+        fs::write(backing.join("small.bin"), vec![9u8; 16]).unwrap();
+    });
+
+    let huge = mount.storage_path().join("huge.bin");
+    let error = fs::File::open(&huge).expect_err("opening it should be refused");
+    assert_eq!(
+        error.raw_os_error(),
+        Some(libc::EFBIG),
+        "refuse at open, before `cp` has created its destination: {error}"
+    );
+    assert_eq!(
+        mount.full_fill_count(),
+        0,
+        "nothing may be downloaded for a file we refuse"
+    );
+
+    // The file is still listed, and its size still reported: only reading it is
+    // refused.
+    let listed = fs::metadata(&huge).expect("metadata still works");
+    assert_eq!(listed.len(), FILE_SIZE as u64);
+
+    // And a file under the limit on the same device reads normally.
+    assert_eq!(
+        fs::read(mount.storage_path().join("small.bin")).expect("small read failed"),
+        vec![9u8; 16]
+    );
+}
+
+#[test]
+#[ignore]
+fn test_a_zero_limit_reads_a_file_that_the_default_limit_would_refuse() {
+    const FILE_SIZE: usize = 512 * 1024;
+    let mount = TestMount::no_partial_read(0, |backing| {
+        let data: Vec<u8> = (0..FILE_SIZE).map(|i| pattern_byte(i as u64)).collect();
+        fs::write(backing.join("big.bin"), data).unwrap();
+    });
+
+    // Same file, same device: with the ceiling lifted it just reads.
+    let content = fs::read(mount.storage_path().join("big.bin")).expect("read failed");
+    assert_eq!(content, pattern_bytes(0, FILE_SIZE));
+    assert_eq!(mount.full_fill_count(), 1);
+}
+
+#[test]
+#[ignore]
+fn test_writing_a_large_file_is_not_blocked_by_the_read_limit() {
+    // The limit is about holding the session open for a READ. An overwrite
+    // replaces the object without reading a byte of it, so a write-only open
+    // must not be refused, or a big file would become unwritable too.
+    const FILE_SIZE: usize = 256 * 1024;
+    let mount = TestMount::no_partial_read(1, |backing| {
+        fs::write(backing.join("target.bin"), vec![1u8; FILE_SIZE]).unwrap();
+    });
+
+    let path = mount.storage_path().join("target.bin");
+    assert!(
+        fs::File::open(&path).is_err(),
+        "reading it is refused, which is what makes this test meaningful"
+    );
+
+    use std::io::Write as _;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .expect("opening it write-only must be allowed");
+    file.write_all(b"replaced").expect("write failed");
+    drop(file);
+
+    // `close()` does not wait for FUSE `release`, and the upload happens there.
+    // One more call through the mount orders it: `fuser` dispatches on a single
+    // thread, so this can't be served before the release ahead of it is done.
+    let _ = fs::metadata(mount.storage_path().join("target.bin"));
+
+    assert_eq!(
+        fs::read(mount.backing_path().join("target.bin")).expect("backing read failed"),
+        b"replaced",
+        "the write reached the device"
+    );
+}

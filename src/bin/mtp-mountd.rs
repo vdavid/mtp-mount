@@ -10,14 +10,17 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use clap::Parser;
-use log::{error, info};
+use log::info;
 
 use mtp_mount::daemon::dryrun::{DryRun, DryRunCommand};
 use mtp_mount::daemon::supervisor::{Command, Supervisor, SupervisorConfig};
 use mtp_mount::daemon::unmount::clean_stale_mounts;
 use mtp_mount::daemon::usb::{spawn_dry_run_watch, spawn_hotplug_watch, UsbSource};
 use mtp_mount::daemon::{mount_root_from_env, RUNTIME_SUBDIR};
+use mtp_mount::fs::DEFAULT_FULL_DOWNLOAD_LIMIT;
 use mtp_mount::hints::{indent, BUSY_HINT, PERMISSION_HINT};
+use mtp_mount::shutdown::spawn_signal_handler;
+use mtp_mount::size::{format_size, parse_size};
 use mtp_mount::spool;
 
 /// Mount MTP devices automatically, as they're plugged in.
@@ -40,10 +43,17 @@ struct Cli {
     #[arg(short, long)]
     read_only: bool,
 
+    /// Largest file to read from a device with no partial-read support, e.g. 8G (0 for no limit)
+    #[arg(long, value_name = "SIZE", value_parser = parse_size, default_value = DEFAULT_FULL_DOWNLOAD_LIMIT_ARG)]
+    full_download_limit: u64,
+
     /// Report what would be mounted as devices come and go, and mount nothing
     #[arg(long)]
     dry_run: bool,
 }
+
+/// The default for `--full-download-limit`, spelled the way `--help` shows it.
+const DEFAULT_FULL_DOWNLOAD_LIMIT_ARG: &str = "4G";
 
 fn long_help() -> String {
     format!(
@@ -104,9 +114,16 @@ NOTES:
 
     There's no reconnect window: a device that goes away is unmounted at once,
     and hotplug mounts it again when it comes back. Waiting instead would
-    freeze every process touching the mount for the length of the window.",
+    freeze every process touching the mount for the length of the window.
+
+    A few devices (some Nintendo Switch MTP apps, simple PTP responders) can
+    only send whole objects rather than byte ranges. Reading a file there starts
+    one whole-file download that holds the device until it finishes, so files
+    above --full-download-limit (default {limit}) are refused with \"File too
+    large\" instead. Raise it, or pass 0, when you mean to copy a big one.",
         busy = indent(BUSY_HINT, "        "),
         permission = indent(PERMISSION_HINT, "        "),
+        limit = format_size(DEFAULT_FULL_DOWNLOAD_LIMIT),
     )
 }
 
@@ -179,7 +196,10 @@ fn main() {
     );
 
     let supervisor = Supervisor::new(
-        SupervisorConfig::new(mount_root, spool_dir, cli.read_only),
+        SupervisorConfig {
+            full_download_limit: cli.full_download_limit,
+            ..SupervisorConfig::new(mount_root, spool_dir, cli.read_only)
+        },
         Arc::new(UsbSource),
         handle,
         commands,
@@ -221,38 +241,25 @@ fn run_dry_run(mount_root: PathBuf) {
     DryRun::new(mount_root).run(inbox);
 }
 
-/// Turn a stop signal into whatever the caller wants to stop.
-///
-/// `systemd` stops services with `SIGTERM`, and a person stops one in a
-/// terminal with `SIGINT`. Both have to unmount everything on the way out:
-/// mounts left behind after a `systemctl --user stop` are exactly the wedged
-/// directories this daemon exists to avoid.
-fn spawn_signal_handler<F>(rt: &tokio::runtime::Handle, on_signal: F)
-where
-    F: FnOnce(&str) + Send + 'static,
-{
-    rt.spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
 
-        let mut terminate = match signal(SignalKind::terminate()) {
-            Ok(stream) => stream,
-            Err(e) => {
-                error!("Can't listen for SIGTERM: {e}");
-                return;
-            }
-        };
-        let mut interrupt = match signal(SignalKind::interrupt()) {
-            Ok(stream) => stream,
-            Err(e) => {
-                error!("Can't listen for SIGINT: {e}");
-                return;
-            }
-        };
+    #[test]
+    fn the_cli_definition_is_well_formed() {
+        Cli::command().debug_assert();
+    }
 
-        let signal_name = tokio::select! {
-            _ = terminate.recv() => "SIGTERM",
-            _ = interrupt.recv() => "SIGINT",
-        };
-        on_signal(signal_name);
-    });
+    #[test]
+    fn default_value_parser_matches_the_constant() {
+        assert_eq!(
+            parse_size(DEFAULT_FULL_DOWNLOAD_LIMIT_ARG),
+            Ok(DEFAULT_FULL_DOWNLOAD_LIMIT)
+        );
+        assert_eq!(
+            Cli::parse_from(["mtp-mountd"]).full_download_limit,
+            DEFAULT_FULL_DOWNLOAD_LIMIT
+        );
+    }
 }
