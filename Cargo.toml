@@ -31,7 +31,7 @@ name = "mtp-mountd"
 path = "src/bin/mtp-mountd.rs"
 
 [dependencies]
-mtp-rs = { version = "0.31.0", features = ["virtual-device"] }
+mtp-rs = { version = "0.32.0", features = ["virtual-device"] }
 fuser = "0.18"
 tokio = { version = "1.51", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 clap = { version = "4.6", features = ["derive"] }
