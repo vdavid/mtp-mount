@@ -53,7 +53,7 @@ pub fn format_size(bytes: u64) -> String {
         (1024, "KiB"),
     ];
     for (scale, unit) in UNITS {
-        if bytes >= scale && bytes % scale == 0 {
+        if bytes >= scale && bytes.is_multiple_of(scale) {
             return format!("{} {unit}", bytes / scale);
         }
     }

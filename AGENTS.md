@@ -270,7 +270,7 @@ notices a dead session on its next operation, the USB watch only on its next pol
 
 ## Testing
 
-- **Library unit tests** (124): inode table, write buffer, sparse cache and sequential-fill coordination, fill tracking and cancellation, size parsing, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal, mount-root resolution, device directory naming, mountpoint detection, stale-mount sweep, dry-run key derivation. Run with `cargo test --lib`.
+- **Library unit tests** (126): device date conversion, inode table, write buffer, sparse cache and sequential-fill coordination, fill tracking and cancellation, size parsing, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal, mount-root resolution, device directory naming, mountpoint detection, stale-mount sweep, dry-run key derivation. Run with `cargo test --lib`.
 - **Binary tests** (3 for `mtp-mount`, 2 for `mtp-mountd`): the clap definitions are well-formed and `--help`'s `4G` default parses back to `DEFAULT_FULL_DOWNLOAD_LIMIT`, so the help text can't drift from what the mount does. `cargo test --bins`.
 - **Integration tests** (35): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring, partial reads, reconnects, re-keyed handles, and the whole-object fallback. Linux only (needs `libfuse3-dev`), except the one non-ignored test below. Run with `cargo test --test integration -- --ignored --test-threads=1`
 - **Daemon tests** (8, `tests/daemon.rs`): drive `Supervisor` through its command channel and assert against the real filesystem. Linux only, `cargo test --test daemon -- --ignored --test-threads=1`. See below.
@@ -346,7 +346,7 @@ is gone (verified by reverting the fix, which fails that test with `EIO`).
 
 - **Minimal**: correct POSIX subset, not everything
 - **No data loss**: safe flush sequence protects against upload failures
-- **Well-tested**: 178 tests, virtual device integration, no hardware needed
+- **Well-tested**: 180 tests, virtual device integration, no hardware needed
 
 ## Things to avoid
 
@@ -378,3 +378,11 @@ text from drifting away from the constant the code uses.
 ## Code style
 
 Run `just check` before committing. `cargo fmt`, `cargo clippy -D warnings`, tests for new functionality.
+
+## MSRV policy
+
+- **Promise**: the Rust releases from the last 12 months, the same policy as `mtp-rs`. `rust-version` in `Cargo.toml` is the oldest stable in that window, or older if nothing needs newer, and never below `mtp-rs`'s own.
+- **Scope**: what `cargo install mtp-mount` compiles (the library and both binaries). Tests and dev-dependencies run on stable only.
+- **How it's checked**: CI's `msrv` job and `just msrv` run `cargo update` with `CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback` on the MSRV toolchain, then `cargo check --lib --bins`. That builds the graph a consumer on the MSRV would resolve, so the committed `Cargo.lock` is free to hold versions that need a newer Rust.
+- **Never cap a dependency (in `Cargo.toml` or `renovate.json`) for the MSRV.** A red `msrv` job means a consumer on the MSRV really can't build us: raise the MSRV instead.
+- **Raising it** is a minor version bump with a changelog line, touching `Cargo.toml`'s `rust-version`, the `msrv` job in `.github/workflows/ci.yml`, and the `msrv` recipe in `justfile` in one commit.
