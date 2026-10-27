@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-27
+
+Big folders on Android phones list 10x faster, a cancelled or interrupted transfer no longer wedges the phone, and the MSRV moves to a rolling 12 months (now Rust 1.91).
+
+0.5.0 was tagged but never published to crates.io, so on crates.io this release also brings everything listed under 0.5.0 below.
+
+### Changed
+
+- **Breaking for source builds: the MSRV is now Rust 1.91 (was 1.85).** mtp-mount now supports the Rust releases from the last 12 months, the same policy as mtp-rs, and raising it is always a minor version bump with a line here. Nothing is capped for old compilers anymore: on an older Rust, Cargo's MSRV-aware resolver picks dependency versions you can build.
+- **Updated to mtp-rs 0.35.0** (from 0.31.0), picking up:
+  - **Folder listings 10x+ faster on Android.** A folder is listed in six requests instead of one per file, when the device supports it: on a Galaxy S23 Ultra, 3,248 photos list in 0.4 s instead of 5.5 s. So `ls` and file managers on a camera roll stop crawling. Devices without the operation keep the old path.
+  - **Cancelling a transfer works on phones that refuse the USB cancel request** (seen on a Xiaomi POCO X6 Pro), instead of leaving the phone stuck until a replug. That's the cancel mtp-mount sends when a mount goes down mid-transfer.
+  - **A process killed mid-download no longer wedges the phone for the next one.** Opening the device recognizes the leftover transfer, drains it, and carries on, so a remount after a crash works without a replug.
+
+### Fixed
+
+- **File dates from a device that reports a time zone are no longer shifted by it.** A device that writes its dates with `Z` or a `±hhmm` offset had every file's modification time off by that offset. Zoneless dates (what Android sends) read exactly as before.
+
 ## [0.5.0] - 2026-08-27
 
 Devices that can only hand over whole files now work, and a transfer in flight survives being interrupted.
