@@ -133,23 +133,13 @@ pub struct MtpFsConfig {
     pub unplug: UnplugSwitch,
 }
 
+/// A date that carries its own offset uses it; a zoneless one (what Android
+/// sends: the phone's local time) is read as UTC. Invalid or pre-1970 dates
+/// clamp to the epoch.
 fn mtp_datetime_to_system_time(dt: &mtp_rs::DateTime) -> SystemTime {
-    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-        let y = if m <= 2 { y - 1 } else { y };
-        let era = if y >= 0 { y } else { y - 399 } / 400;
-        let yoe = (y - era * 400) as u64;
-        let m_adj = if m > 2 { m - 3 } else { m + 9 } as u64;
-        let doy = (153 * m_adj + 2) / 5 + d as u64 - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        era * 146097 + doe as i64 - 719468
-    }
-
-    let days = days_from_civil(dt.year as i64, dt.month as i64, dt.day as i64);
-    let secs = days * 86400 + dt.hour as i64 * 3600 + dt.minute as i64 * 60 + dt.second as i64;
-    if secs >= 0 {
-        UNIX_EPOCH + Duration::from_secs(secs as u64)
-    } else {
-        UNIX_EPOCH
+    match dt.to_unix_seconds_with_fallback(mtp_rs::UtcOffset::UTC) {
+        Some(secs) if secs >= 0 => UNIX_EPOCH + Duration::from_secs(secs as u64),
+        _ => UNIX_EPOCH,
     }
 }
 
@@ -2027,6 +2017,25 @@ mod tests {
     use std::io::Write as _;
 
     const CHUNK: usize = UPLOAD_CHUNK;
+
+    fn unix_secs(t: SystemTime) -> u64 {
+        t.duration_since(UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    #[test]
+    fn a_zoneless_device_date_reads_as_utc() {
+        let dt = mtp_rs::DateTime::new(2024, 3, 1, 12, 0, 0).unwrap();
+        assert_eq!(unix_secs(mtp_datetime_to_system_time(&dt)), 1_709_294_400);
+    }
+
+    #[test]
+    fn a_device_date_with_an_offset_is_shifted_by_it() {
+        // 12:00 at UTC+02:00 is 10:00 UTC.
+        let dt = mtp_rs::DateTime::new(2024, 3, 1, 12, 0, 0)
+            .unwrap()
+            .with_offset(mtp_rs::UtcOffset::from_minutes(120).unwrap());
+        assert_eq!(unix_secs(mtp_datetime_to_system_time(&dt)), 1_709_287_200);
+    }
 
     /// A temp file holding `content`, rewound to the start.
     fn spool_file(content: &[u8]) -> std::fs::File {
