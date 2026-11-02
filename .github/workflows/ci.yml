@@ -59,7 +59,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           # Keep in sync with rust-version in Cargo.toml and the justfile's `msrv` recipe.
-          toolchain: "1.91"
+          toolchain: "1.99"
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
