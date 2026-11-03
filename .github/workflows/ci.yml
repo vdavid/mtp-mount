@@ -45,7 +45,7 @@ jobs:
   # dev-dependencies are ours alone, so they run on stable only. It resolves dependencies afresh the way a consumer on
   # the MSRV does, so the committed Cargo.lock (kept current by Renovate) never has to stay MSRV-compatible.
   msrv:
-    name: Verify MSRV (1.91)
+    name: Verify MSRV (1.90)
     runs-on: ubuntu-latest
 
     steps:
@@ -59,7 +59,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           # Keep in sync with rust-version in Cargo.toml and the justfile's `msrv` recipe.
-          toolchain: "1.99"
+          toolchain: "1.90"
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2

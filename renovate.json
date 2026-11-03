@@ -34,6 +34,12 @@
       "schedule": ["at any time"],
       "automerge": true,
       "groupName": null
+    },
+    {
+      "description": "The msrv CI job runs Rust at the MSRV (rust-version in Cargo.toml). A bumped toolchain literal silently stops CI from checking the MSRV (it once moved to 1.99, #29), so the toolchain only moves with a deliberate MSRV change.",
+      "matchManagers": ["github-actions"],
+      "matchDepNames": ["rust"],
+      "enabled": false
     }
   ],
   "cargo": {

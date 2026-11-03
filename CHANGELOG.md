@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Moving a file onto an existing name no longer lists the name twice.** `mv a b` over an existing `b` left the old `b` in the mount's inode table, so a listing showed two `b`s until the folder was reloaded. The same went for creating a file under a name the table already held. Found by the new inode-table fuzz target.
 - **A write far past the end of a file no longer allocates the whole gap.** The write buffer zero-filled the gap in memory first, so one write at a large offset could use up all memory and take the mount down. The gap is now a hole in the spool file, which reads as zeros and costs no memory.
 - **An empty write past the end of a file no longer changes its size.** It set the size to its offset, so the size reported while the file was open counted bytes the upload never had.
+- **A device that sends a malformed response can no longer abort the mount.** Updated to mtp-rs 0.37.2, which rejects a response whose length field is shorter than its header instead of crashing the process.
+
+### Changed
+
+- **The MSRV is now Rust 1.90 (was 1.91)**, matching mtp-rs 0.37.2. Lowering it breaks no one. CI's MSRV job had drifted to Rust 1.99 through a Renovate bump, so it checks 1.90 again, and Renovate now leaves that toolchain alone.
 
 ### Added
 

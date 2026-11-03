@@ -11,7 +11,7 @@
 #     doc         - Build documentation
 #     audit       - Security audit (requires cargo-audit)
 #     deny        - License/dependency check (requires cargo-deny)
-#     msrv        - Check the library and binaries build on the MSRV (1.91)
+#     msrv        - Check the library and binaries build on the MSRV (1.90)
 #
 #   Composite commands:
 #     check       - Run fast checks: fmt-check, clippy, test, doc (default)
@@ -78,23 +78,23 @@ doc:
     @cargo doc --no-deps {{ fuse_features }} --quiet
     @echo "[+] Docs built"
 
-# Check the library and both binaries build on the MSRV (Rust 1.91), the promise
+# Check the library and both binaries build on the MSRV (Rust 1.90), the promise
 # `cargo install mtp-mount` relies on. Same steps as CI's `msrv` job: it
-# resolves dependencies afresh like a consumer on 1.91 would, then puts the
+# resolves dependencies afresh like a consumer on 1.90 would, then puts the
 # committed Cargo.lock back.
 msrv:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "[*] Checking MSRV (1.91) compatibility..."
-    if ! rustup run 1.91.0 rustc --version &> /dev/null; then
-        echo "[!] Rust 1.91 not found. Install with: rustup toolchain install 1.91.0"
+    echo "[*] Checking MSRV (1.90) compatibility..."
+    if ! rustup run 1.90.0 rustc --version &> /dev/null; then
+        echo "[!] Rust 1.90 not found. Install with: rustup toolchain install 1.90.0"
         exit 1
     fi
     mkdir -p target
     cp Cargo.lock target/Cargo.lock.msrv-backup
     trap 'mv target/Cargo.lock.msrv-backup Cargo.lock' EXIT
-    CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo +1.91.0 update --quiet
-    RUSTFLAGS="-D warnings" CARGO_TARGET_DIR=target/msrv cargo +1.91.0 check --lib --bins {{ fuse_features }} --quiet
+    CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo +1.90.0 update --quiet
+    RUSTFLAGS="-D warnings" CARGO_TARGET_DIR=target/msrv cargo +1.90.0 check --lib --bins {{ fuse_features }} --quiet
     echo "[+] MSRV check passed"
 
 # Run security audit (requires cargo-audit)
