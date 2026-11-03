@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mtp_rs::mtp::MtpDevice;
-use mtp_rs::transport::virtual_device::config::{VirtualDeviceConfig, VirtualStorageConfig};
+use mtp_rs::virtual_device::{VirtualDeviceConfig, VirtualStorageConfig};
 use tempfile::TempDir;
 
 use mtp_mount::device::{DeviceOpener, UnplugSwitch};
@@ -349,11 +349,8 @@ impl TestMount {
     /// MediaProvider does across a media rescan: the file stays put, the handle
     /// the mount cached stops resolving.
     fn rekey(&self, rel_path: &str) {
-        mtp_rs::transport::virtual_device::registry::rekey_virtual_object(
-            &self.serial,
-            Path::new(rel_path),
-        )
-        .expect("the object must be tracked, so list its parent first");
+        mtp_rs::virtual_device::rekey_virtual_object(&self.serial, Path::new(rel_path))
+            .expect("the object must be tracked, so list its parent first");
     }
 
     /// How many times the mount has opened the device (one at startup, one per
@@ -840,9 +837,7 @@ fn test_full_sequential_read() {
 /// and points at the better seam.
 #[test]
 fn test_unregistering_a_virtual_device_does_not_disconnect_an_open_one() {
-    use mtp_rs::transport::virtual_device::registry::{
-        register_virtual_device, unregister_virtual_device,
-    };
+    use mtp_rs::virtual_device::{register_virtual_device, unregister_virtual_device};
 
     let backing_dir = TempDir::new().unwrap();
     fs::write(backing_dir.path().join("still_here.txt"), "hello").unwrap();

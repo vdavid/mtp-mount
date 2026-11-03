@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mtp_rs::mtp::MtpDevice;
-use mtp_rs::transport::virtual_device::config::{VirtualDeviceConfig, VirtualStorageConfig};
+use mtp_rs::virtual_device::{VirtualDeviceConfig, VirtualStorageConfig};
 use tempfile::TempDir;
 
 use mtp_mount::daemon::supervisor::{
