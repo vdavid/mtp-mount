@@ -146,21 +146,38 @@ impl InodeTable {
         ino
     }
 
+    /// Drops whatever entry other than `keep` sits at `(parent, name)`. A name
+    /// holds one entry: leaving the old one would keep it in `children` while
+    /// `lookup` finds the new one, so a listing would show the name twice.
+    fn evict_name(&mut self, parent: u64, name: &str, keep: u64) {
+        if let Some(old) = self.lookup(parent, name) {
+            if old != keep {
+                self.remove(old);
+            }
+        }
+    }
+
     fn insert(&mut self, entry: InodeEntry) -> u64 {
         let ino = entry.inode;
         let parent = entry.parent;
         let name = entry.name.clone();
 
+        self.evict_name(parent, &name, ino);
         self.entries.insert(ino, entry);
         self.name_index.insert((parent, name), ino);
         self.children_index.entry(parent).or_default().push(ino);
         ino
     }
 
-    /// Adds a storage as a child of root. Returns the new inode number.
+    /// Adds a storage as a child of root, dated now. Returns the new inode number.
     pub fn add_storage(&mut self, storage_id: StorageId, name: String) -> u64 {
+        self.add_storage_at(storage_id, name, SystemTime::now())
+    }
+
+    /// [`add_storage`](Self::add_storage) with the time given, so the table
+    /// itself reads no clock (the fuzz targets need that).
+    pub fn add_storage_at(&mut self, storage_id: StorageId, name: String, now: SystemTime) -> u64 {
         let ino = self.alloc_inode();
-        let now = SystemTime::now();
         self.insert(InodeEntry {
             inode: ino,
             parent: FUSE_ROOT_INODE,
@@ -312,8 +329,14 @@ impl InodeTable {
         Some(entry)
     }
 
-    /// Updates an entry's parent and name (for rename/move operations).
+    /// Updates an entry's parent and name (for rename/move operations). An
+    /// entry already at the destination is replaced, as `rename(2)` replaces
+    /// the file it moves onto.
     pub fn rename(&mut self, inode: u64, new_parent: u64, new_name: String) {
+        if !self.entries.contains_key(&inode) {
+            return;
+        }
+        self.evict_name(new_parent, &new_name, inode);
         let Some(entry) = self.entries.get_mut(&inode) else {
             return;
         };
@@ -713,5 +736,59 @@ mod tests {
 
         table.get_mut(file_ino).unwrap().size = 999;
         assert_eq!(table.get(file_ino).unwrap().size, 999);
+    }
+
+    /// Regression (`fuzz_inode_table` finds it): `mv a b` over an existing `b`
+    /// left the old `b` in the table. `lookup` found the moved file, but
+    /// `children` still listed both, so a listing showed two `b`s and the old
+    /// one could never be looked up again.
+    #[test]
+    fn test_rename_over_existing_name_replaces_it() {
+        let mut table = InodeTable::new();
+        let storage = table.add_storage(StorageId(1), "Internal".into());
+        let mtime = SystemTime::UNIX_EPOCH;
+        let a = table.add_object(storage, ObjectHandle(1), "a".into(), false, 1, mtime);
+        let b = table.add_object(storage, ObjectHandle(2), "b".into(), false, 2, mtime);
+
+        table.rename(a, storage, "b".into());
+
+        assert_eq!(table.lookup(storage, "b"), Some(a));
+        assert_eq!(table.children(storage), vec![a]);
+        assert!(table.get(b).is_none());
+    }
+
+    /// Regression (`fuzz_inode_table` finds it): adding an object under a name
+    /// that's already taken shadowed the old entry the same way.
+    #[test]
+    fn test_add_object_over_existing_name_replaces_it() {
+        let mut table = InodeTable::new();
+        let storage = table.add_storage(StorageId(1), "Internal".into());
+        let mtime = SystemTime::UNIX_EPOCH;
+        let old = table.add_object(storage, ObjectHandle(1), "a".into(), false, 1, mtime);
+
+        let new = table.add_object(storage, ObjectHandle(2), "a".into(), true, 0, mtime);
+
+        assert_eq!(table.lookup(storage, "a"), Some(new));
+        assert_eq!(table.children(storage), vec![new]);
+        assert!(table.get(old).is_none());
+    }
+
+    #[test]
+    fn test_rename_to_the_same_place_keeps_the_entry() {
+        let mut table = InodeTable::new();
+        let storage = table.add_storage(StorageId(1), "Internal".into());
+        let a = table.add_object(
+            storage,
+            ObjectHandle(1),
+            "a".into(),
+            false,
+            1,
+            SystemTime::UNIX_EPOCH,
+        );
+
+        table.rename(a, storage, "a".into());
+
+        assert_eq!(table.lookup(storage, "a"), Some(a));
+        assert_eq!(table.children(storage), vec![a]);
     }
 }

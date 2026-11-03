@@ -5,12 +5,16 @@ use std::path::{Path, PathBuf};
 
 use crate::error::MountError;
 
-/// Per-file write buffer backed by an unlinked temp file in the spool dir.
-pub struct FileBuffer {
+/// Per-file write buffer, backed by an unlinked temp file in the spool dir.
+///
+/// Generic over its storage so the fuzz targets can run it on a
+/// `Cursor<Vec<u8>>`, with no file. Everything in the mount uses the default,
+/// [`std::fs::File`].
+pub struct FileBuffer<F = std::fs::File> {
     pub inode: u64,
     #[allow(dead_code)]
     pub original_size: u64,
-    file: std::fs::File,
+    file: F,
     len: u64,
     dirty: bool,
 }
@@ -20,29 +24,46 @@ impl FileBuffer {
     /// written buffers here before upload, so `spool_dir` must be disk-backed
     /// (see [`crate::spool`]).
     pub fn new(inode: u64, original_size: u64, spool_dir: &Path) -> io::Result<Self> {
-        Ok(Self {
+        Ok(Self::with_storage(
             inode,
             original_size,
-            file: tempfile::tempfile_in(spool_dir)?,
+            tempfile::tempfile_in(spool_dir)?,
+        ))
+    }
+}
+
+impl<F: Read + Write + Seek> FileBuffer<F> {
+    /// A buffer over `storage`, which must start empty.
+    pub fn with_storage(inode: u64, original_size: u64, storage: F) -> Self {
+        Self {
+            inode,
+            original_size,
+            file: storage,
             len: 0,
             dirty: false,
-        })
+        }
     }
 
-    /// Write `data` at `offset`, growing the file and zero-filling gaps as needed.
-    /// Returns the number of bytes written.
+    /// Write `data` at `offset`, growing the file as needed. A gap before
+    /// `offset` reads back as zeros. Returns the number of bytes written.
+    ///
+    /// A negative offset, or one whose end doesn't fit a `u64`, is
+    /// `InvalidInput`.
     pub fn write_at(&mut self, offset: i64, data: &[u8]) -> io::Result<u32> {
-        let offset = offset as u64;
-        let end = offset + data.len() as u64;
-
-        // Zero-fill gaps if writing past current end
-        if offset > self.len {
-            self.file.seek(SeekFrom::Start(self.len))?;
-            let gap = offset - self.len;
-            let zeros = vec![0u8; gap as usize];
-            self.file.write_all(&zeros)?;
+        let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "write offset out of range");
+        let offset = u64::try_from(offset).map_err(|_| invalid())?;
+        let end = offset.checked_add(data.len() as u64).ok_or_else(invalid)?;
+        // An empty write changes nothing, as with `pwrite(2)`. Counting its
+        // offset as the new length would report bytes the spool file doesn't
+        // have, and the upload would come up short.
+        if data.is_empty() {
+            return Ok(0);
         }
 
+        // Writing past the end leaves a hole that reads as zeros, in a file
+        // (POSIX) and in a `Cursor<Vec<u8>>` alike. Don't zero-fill it by hand:
+        // that allocated the whole gap, so one `pwrite` at a large offset could
+        // take the mount down.
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(data)?;
 
@@ -54,9 +75,11 @@ impl FileBuffer {
     }
 
     /// Read up to `size` bytes starting at `offset`. Returns fewer bytes if
-    /// the offset is near or past the end.
+    /// the offset is near or past the end, and none for a negative offset.
     pub fn read_at(&mut self, offset: i64, size: u32) -> io::Result<Vec<u8>> {
-        let offset = offset as u64;
+        let Ok(offset) = u64::try_from(offset) else {
+            return Ok(Vec::new());
+        };
         if offset >= self.len {
             return Ok(Vec::new());
         }
@@ -80,8 +103,8 @@ impl FileBuffer {
         self.dirty
     }
 
-    /// Consume the buffer and return the backing file.
-    pub fn into_file(self) -> std::fs::File {
+    /// Consume the buffer and return the backing storage.
+    pub fn into_file(self) -> F {
         self.file
     }
 }
@@ -308,5 +331,49 @@ mod tests {
         assert!(prefix.iter().all(|&b| b == 0));
         let data = wb.read(1, 1000, 6).unwrap();
         assert_eq!(&data, b"sparse");
+    }
+
+    /// Regression: a write far past the end zero-filled the gap in memory
+    /// first, so one `pwrite` at a terabyte offset allocated a terabyte. Now
+    /// the gap is a hole in the spool file, so this is instant and uses no
+    /// memory (or disk, on a sparse-file filesystem).
+    #[test]
+    fn test_write_far_past_the_end_leaves_a_hole() {
+        let mut wb = new_write_buffer();
+        wb.open(1, 100, 0).unwrap();
+        let far = 1i64 << 40;
+        wb.write(1, far, b"x").unwrap();
+        assert_eq!(wb.size(1), Some((1u64 << 40) + 1));
+        assert_eq!(wb.read(1, far - 2, 3).unwrap(), b"\0\0x");
+    }
+
+    #[test]
+    fn test_negative_offset_is_rejected() {
+        let mut wb = new_write_buffer();
+        wb.open(1, 100, 0).unwrap();
+        assert!(wb.write(1, -1, b"x").is_err());
+        assert!(wb.read(1, -1, 10).unwrap().is_empty());
+        assert_eq!(wb.size(1), Some(0));
+    }
+
+    /// Regression (found writing `fuzz_file_buffer`): an empty write past the
+    /// end set the length to its offset, so getattr and the upload counted
+    /// bytes the spool file never got.
+    #[test]
+    fn test_empty_write_changes_nothing() {
+        let mut wb = new_write_buffer();
+        wb.open(1, 100, 0).unwrap();
+        assert_eq!(wb.write(1, 10, b"").unwrap(), 0);
+        assert_eq!(wb.size(1), Some(0));
+        assert!(!wb.flush(1).unwrap().is_dirty());
+    }
+
+    #[test]
+    fn test_in_memory_storage_matches_a_file() {
+        let mut fb = FileBuffer::with_storage(1, 0, std::io::Cursor::new(Vec::new()));
+        fb.write_at(3, b"abc").unwrap();
+        fb.write_at(0, b"Z").unwrap();
+        assert_eq!(fb.read_at(0, 10).unwrap(), b"Z\0\0abc");
+        assert_eq!(fb.into_file().into_inner(), b"Z\0\0abc");
     }
 }
