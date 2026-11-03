@@ -1,2 +1,4 @@
 /target
 /.idea
+# Worktree warm-start markers (new-worktree.sh)
+.warming-worktree*
