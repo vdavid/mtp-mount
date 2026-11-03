@@ -1,0 +1,54 @@
+[package]
+name = "mtp-mount-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Its own workspace, outside the main package: the targets need nightly (libFuzzer's sanitizer
+# instrumentation), and cargo-fuzz keeps a separate Cargo.lock here.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+mtp-mount = { path = ".." }
+# The same mtp-rs the mount uses, for `ObjectHandle` and `StorageId`.
+mtp-rs = "0.37.0"
+
+# On macOS, compile fuser without its mount calls, so the targets build with no macFUSE. Linux
+# needs nothing: fuser mounts in pure Rust there.
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { version = "0.18", features = ["macos-no-mount"] }
+
+# One `bin` per target. The weekly workflow reads this list, so a new `[[bin]]` is fuzzed
+# without editing it. Keep `test`/`doc`/`bench` off: a target isn't a standalone program.
+
+[[bin]]
+name = "fuzz_size"
+path = "fuzz_targets/fuzz_size.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_range_set"
+path = "fuzz_targets/fuzz_range_set.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_file_buffer"
+path = "fuzz_targets/fuzz_file_buffer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_inode_table"
+path = "fuzz_targets/fuzz_inode_table.rs"
+test = false
+doc = false
+bench = false

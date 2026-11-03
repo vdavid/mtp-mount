@@ -6,6 +6,7 @@ pub mod fill;
 pub mod fs;
 pub mod hints;
 pub mod inode;
+pub mod ranges;
 pub mod reconnect;
 pub mod shutdown;
 pub mod size;

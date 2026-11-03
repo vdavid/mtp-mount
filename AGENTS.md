@@ -24,6 +24,7 @@ src/
   lib.rs           # Module re-exports for integration tests
   fs.rs            # MtpFs: implements fuser::Filesystem
   inode.rs         # Inode table: maps FUSE inodes <-> MTP object handles
+  ranges.rs        # RangeSet: which byte ranges the sparse cache holds
   buffer.rs        # Write buffer: temp-file-backed, flushes to MTP on close
   device.rs        # DeviceOpener trait (how the mount (re)opens its device) + UnplugSwitch
   reconnect.rs     # ReconnectPolicy: the timeout window and its backoff schedule
@@ -40,6 +41,7 @@ src/
     unmount.rs     # Forced unmount, mountpoint detection, stale-mount sweep
   sparse_cache.rs  # Byte-range cache for on-demand partial reads
   error.rs         # MountError enum
+fuzz/              # cargo-fuzz targets over size, RangeSet, FileBuffer, InodeTable; read its CLAUDE.md first
 tests/
   integration.rs   # FUSE mount tests against mtp-rs virtual device
   daemon.rs        # Daemon supervisor tests: synthetic hotplug -> real FUSE mounts
@@ -270,10 +272,11 @@ notices a dead session on its next operation, the USB watch only on its next pol
 
 ## Testing
 
-- **Library unit tests** (126): device date conversion, inode table, write buffer, sparse cache and sequential-fill coordination, fill tracking and cancellation, size parsing, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal, mount-root resolution, device directory naming, mountpoint detection, stale-mount sweep, dry-run key derivation. Run with `cargo test --lib`.
+- **Library unit tests** (136): device date conversion, inode table, write buffer, range set, sparse cache and sequential-fill coordination, fill tracking and cancellation, size parsing, upload streaming, spool-dir resolution, device-open hints, reconnect policy, shutdown signal, mount-root resolution, device directory naming, mountpoint detection, stale-mount sweep, dry-run key derivation. Run with `cargo test --lib`.
 - **Binary tests** (3 for `mtp-mount`, 2 for `mtp-mountd`): the clap definitions are well-formed and `--help`'s `4G` default parses back to `DEFAULT_FULL_DOWNLOAD_LIMIT`, so the help text can't drift from what the mount does. `cargo test --bins`.
 - **Integration tests** (35): mount a virtual MTP device via FUSE, exercise with `std::fs` operations including device event monitoring, partial reads, reconnects, re-keyed handles, and the whole-object fallback. Linux only (needs `libfuse3-dev`), except the one non-ignored test below. Run with `cargo test --test integration -- --ignored --test-threads=1`
 - **Daemon tests** (8, `tests/daemon.rs`): drive `Supervisor` through its command channel and assert against the real filesystem. Linux only, `cargo test --test daemon -- --ignored --test-threads=1`. See below.
+- **Fuzz targets** (4, `fuzz/`): `size`, `RangeSet`, `FileBuffer`, and `InodeTable`, each against a model. `just fuzz <target>`; `.github/workflows/fuzz.yml` runs them weekly. See `fuzz/CLAUDE.md`.
 - **Dry-run tests** (7, `tests/dry_run.rs`): inject arrivals and departures into the `--dry-run` reporter and assert on the verdict, the wording a person reads, and that a run leaves a temp mount root untouched. No FUSE, no device, so they run everywhere with plain `cargo test`.
 
 ### Testing a disconnect

@@ -7,7 +7,8 @@
 //! writes the fetched bytes via [`SparseCache::write_at`], [`SparseCache::read_at`]
 //! serves the requested slice from the tempfile.
 //!
-//! Ranges are kept sorted and merged so that adjacent writes coalesce.
+//! The range bookkeeping is [`RangeSet`], which keeps ranges sorted and merged
+//! so that adjacent writes coalesce.
 
 use std::future::Future;
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
@@ -17,12 +18,14 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use bytes::Bytes;
 
+use crate::ranges::RangeSet;
+
 /// A tempfile-backed cache that tracks populated byte ranges.
 #[derive(Debug)]
 pub struct SparseCache {
     file: std::fs::File,
-    /// Sorted, non-overlapping, non-adjacent byte ranges that have been written.
-    ranges: Vec<Range<u64>>,
+    /// The byte ranges that have been written.
+    ranges: RangeSet,
     total_size: u64,
 }
 
@@ -40,7 +43,7 @@ impl SparseCache {
         file.set_len(total_size)?;
         Ok(Self {
             file,
-            ranges: Vec::new(),
+            ranges: RangeSet::new(),
             total_size,
         })
     }
@@ -50,35 +53,7 @@ impl SparseCache {
     /// The returned ranges are sorted and clipped to `[0, total_size)`.
     /// If the entire requested range is already populated, returns an empty `Vec`.
     pub fn missing_ranges(&self, offset: u64, size: u64) -> Vec<Range<u64>> {
-        let end = offset.saturating_add(size).min(self.total_size);
-        if offset >= end {
-            return Vec::new();
-        }
-
-        let mut missing = Vec::new();
-        let mut cursor = offset;
-
-        for populated in &self.ranges {
-            if populated.end <= cursor {
-                continue;
-            }
-            if populated.start >= end {
-                break;
-            }
-            if populated.start > cursor {
-                missing.push(cursor..populated.start.min(end));
-            }
-            cursor = populated.end;
-            if cursor >= end {
-                break;
-            }
-        }
-
-        if cursor < end {
-            missing.push(cursor..end);
-        }
-
-        missing
+        self.ranges.missing(offset, size, self.total_size)
     }
 
     /// Write `data` at `offset` and mark `[offset, offset+data.len())` as populated.
@@ -101,8 +76,7 @@ impl SparseCache {
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(data)?;
 
-        let new_range = offset..end;
-        self.insert_range(new_range);
+        self.ranges.insert(offset..end);
         Ok(())
     }
 
@@ -122,34 +96,9 @@ impl SparseCache {
         Ok(buf)
     }
 
-    /// Insert a new range into `self.ranges`, merging with any overlapping or
-    /// adjacent existing ranges. Maintains the sorted/merged invariant.
-    fn insert_range(&mut self, new: Range<u64>) {
-        let mut start = new.start;
-        let mut end = new.end;
-
-        // Remove and merge any existing range that overlaps or touches [start, end).
-        self.ranges.retain(|r| {
-            if r.end < start || r.start > end {
-                true
-            } else {
-                start = start.min(r.start);
-                end = end.max(r.end);
-                false
-            }
-        });
-
-        // Find insertion point to keep ranges sorted by start.
-        let pos = self
-            .ranges
-            .binary_search_by(|r| r.start.cmp(&start))
-            .unwrap_or_else(|p| p);
-        self.ranges.insert(pos, start..end);
-    }
-
     #[cfg(test)]
     pub fn populated_ranges(&self) -> &[Range<u64>] {
-        &self.ranges
+        self.ranges.as_slice()
     }
 }
 

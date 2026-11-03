@@ -5,6 +5,7 @@ mod fill;
 mod fs;
 mod hints;
 mod inode;
+mod ranges;
 mod reconnect;
 mod shutdown;
 mod size;

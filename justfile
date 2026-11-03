@@ -19,6 +19,7 @@
 #     fix         - Auto-fix formatting and clippy warnings
 #
 #   Utility commands:
+#     fuzz        - Fuzz one target for a short sweep (nightly + cargo-fuzz)
 #     clean       - Remove build artifacts
 #     install-tools - Install required development tools
 
@@ -139,6 +140,21 @@ fix: fmt
 # ==============================================================================
 # Utility commands
 # ==============================================================================
+
+# Fuzz one target for a short sweep (default: 5 minutes). See `fuzz/CLAUDE.md`.
+# Example: `just fuzz fuzz_inode_table` or `just fuzz fuzz_range_set 1800`.
+# Requires the nightly toolchain and `cargo-fuzz` (`cargo install cargo-fuzz`).
+fuzz target duration="300":
+    @if ! rustup run nightly rustc --version &> /dev/null; then \
+        echo "[!] Nightly toolchain not found. Install with: rustup toolchain install nightly"; \
+        exit 1; \
+    fi
+    @if ! command -v cargo-fuzz &> /dev/null; then \
+        echo "[!] cargo-fuzz not found. Install with: cargo install cargo-fuzz"; \
+        exit 1; \
+    fi
+    @echo "[*] Fuzzing {{target}} for {{duration}}s..."
+    cargo +nightly fuzz run {{target}} -- -max_total_time={{duration}} -print_final_stats=1
 
 # Remove build artifacts
 clean:

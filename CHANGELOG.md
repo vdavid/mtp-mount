@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Moving a file onto an existing name no longer lists the name twice.** `mv a b` over an existing `b` left the old `b` in the mount's inode table, so a listing showed two `b`s until the folder was reloaded. The same went for creating a file under a name the table already held. Found by the new inode-table fuzz target.
+- **A write far past the end of a file no longer allocates the whole gap.** The write buffer zero-filled the gap in memory first, so one write at a large offset could use up all memory and take the mount down. The gap is now a hole in the spool file, which reads as zeros and costs no memory.
+- **An empty write past the end of a file no longer changes its size.** It set the size to its offset, so the size reported while the file was open counted bytes the upload never had.
+
+### Added
+
+- **Fuzz targets** for size parsing, the sparse read cache's range bookkeeping, the write buffer, and the inode table, each checked against a model, plus a weekly fuzz workflow. They follow OSS Verify's rules (single-threaded, input only), so they can get machine-checked proofs.
+- **License files** (`LICENSE-MIT`, `LICENSE-APACHE`). `Cargo.toml` already said MIT OR Apache-2.0, but the repo had no license text, so GitHub showed none.
+
 ## [0.6.0] - 2026-10-27
 
 Big folders on Android phones list 10x faster, a cancelled or interrupted transfer no longer wedges the phone, and the MSRV moves to a rolling 12 months (now Rust 1.91).
