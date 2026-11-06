@@ -15,7 +15,7 @@ cargo-fuzz = true
 libfuzzer-sys = "=0.4.13"
 mtp-mount = { path = ".." }
 # The same mtp-rs the mount uses, for `ObjectHandle` and `StorageId`.
-mtp-rs = "0.37.2"
+mtp-rs = "0.38.0"
 
 # On macOS, compile fuser without its mount calls, so the targets build with no macFUSE. Linux
 # needs nothing: fuser mounts in pure Rust there.
